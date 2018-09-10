@@ -1,0 +1,14 @@
+FileNames	Batch	Exp
+d11_1.2_S1_L00Aligned.sortedByCoord.out.bam	3	3
+d11_1.3_S2_L00Aligned.sortedByCoord.out.bam	3	3
+d11_2.1_S3_L00Aligned.sortedByCoord.out.bam	3	4
+d11_2.3_S4_L00Aligned.sortedByCoord.out.bam	3	4
+d11_3.1_S5_L00Aligned.sortedByCoord.out.bam	3	5
+d11_3.2_S6_L00Aligned.sortedByCoord.out.bam	3	5
+Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam	2	2
+Day_11_Pellet_RNA_2_S8_L00Aligned.sortedByCoord.out.bam	2	2
+Day_11_Pellet_RNA_5_S9_L00Aligned.sortedByCoord.out.bam	2	2
+X11_days_Pellet_1_S1_L00Aligned.sortedByCoord.out.bam	1	1
+X11_days_Pellet_2_S2_L00Aligned.sortedByCoord.out.bam	1	1
+X12_days_Pellet_3_S3_L00Aligned.sortedByCoord.out.bam	1	1
+X12_days_Pellet_4_S4_L00Aligned.sortedByCoord.out.bam	1	1
