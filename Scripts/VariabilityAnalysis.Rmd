@@ -1,0 +1,1018 @@
+---
+title: "Analysis of variability of day 18 organoids"
+author: "Belinda Phipson"
+date: "27 August 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+I will assume that the time series analsis hasn't been run and will redo the data processing here before the analysis.
+ 
+## Load libraries
+
+```{r}
+# Remove this line Belinda
+setwd("D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/StatisticalAnalysis")
+```
+
+```{r}
+library(edgeR)
+library(limma)
+library(org.Hs.eg.db)
+library(lme4)
+library(RColorBrewer)
+library(NMF)
+library(RUVSeq)
+library(Mfuzz)
+library(scatterplot3d)
+library(biomaRt)
+library(seqinr)
+library(BSgenome)
+source("./Functions/ggplotColors.R")
+source("./Functions/normCounts.R")
+options(digits=3)
+```
+
+## Read in all data and sample information
+
+```{r}
+# Additional samples (later batches), SC6 and C32 organoids
+run1 <- read.delim("./Data/counts-run1.txt",skip=1,header=TRUE,stringsAsFactors=FALSE)
+run2 <- read.delim("./Data/counts-run2.txt",skip=1,header=TRUE,stringsAsFactors=FALSE)
+
+count1 <- run1[,-(1:6)]
+count2 <- run2[,-(1:6)]
+rownames(count1) <- rownames(count2) <- run1$Geneid
+
+colnames(count1) <- gsub("_L00Aligned\\.sortedByCoord\\.out\\.bam","",colnames(count1))
+colnames(count2) <- gsub("_L00Aligned\\.sortedByCoord\\.out\\.bam","",colnames(count2))
+targets.new <- read.table("./Data/targets.txt",stringsAsFactors = FALSE,header=TRUE)
+
+# Combine the two runs together by summing the counts
+counts <- count1+count2
+saminfo <- targets.new[targets.new$Run=="run1",]
+
+# Read in time series data
+ts <- read.delim("./Data/countsD0-D18.txt",header=TRUE,skip=1,stringsAsFactors=FALSE)
+early <- read.delim("./Data/countsEarlyTimes.txt",header=TRUE,skip=1,stringsAsFactors=FALSE)
+targets.ts <- read.table("./Data/targetsALL.txt",header=TRUE,stringsAsFactors=FALSE)
+
+# Read in aditional day 18 data for variability analysis
+litt3 <- read.delim("./Data/countsLitt3.txt",skip=1,header=TRUE,stringsAsFactors = FALSE)
+litt6 <- read.delim("./Data/countsLitt6.txt",skip=1,header=TRUE,stringsAsFactors = FALSE)
+targets.var <- read.table("./Data/targets-var.txt",header=TRUE,stringsAsFactors=FALSE)
+var_data <- cbind(litt6[,-(1:6)],litt3[,-(1:6)])
+m <- match(targets.var$FileName,colnames(var_data))
+data <- var_data[,m[!is.na(m)]]
+targets.var <- targets.var[!is.na(m),]
+targets.var$Time <- 18
+
+# Combine all counts matrices together
+y <- DGEList(cbind(ts[,-(1:6)],early[,-(1:6)],data,counts))
+geno.old <- rep("C32",ncol(y)-ncol(counts))
+geno <- c(geno.old,saminfo$Geno)
+time <- c(targets.ts$Time,targets.var$Time)
+age <- c(time,saminfo$Age)
+var.vial <- targets.var$Exp
+var.vial[var.vial==1] <- 6
+new.vial <- saminfo$Vial+6
+vial <- c(targets.ts$Batch,var.vial,new.vial)
+
+```
+
+## Initial filtering
+
+```{r}
+keep <- rowSums(cpm(y)>=1)>=2
+y.keep <- y[keep,]
+y.keep$samples$lib.size <- colSums(y.keep$counts)
+```
+
+# Separate C32 and SC6 data
+
+We will analyse C32 and SC6 organoids separately. The final dataset had D18 organoids collected at 5 different points in time (batch). At one of these batches, organoids were grown in three separate vials and two organoids from each differentiation were sequenced in order to determine vial-to-vial variability.
+
+```{r}
+# Separate c32 and sc6 data
+targets.all <- data.frame(Sample=colnames(y),geno=geno,age=age,vial=vial,stringsAsFactors = FALSE)
+targets.c32 <- targets.all[geno=="C32",]
+targets.sc6 <- targets.all[geno=="SC6",]
+y.c32 <- y.keep[,geno=="C32"]
+y.c32$samples$lib.size <- colSums(y.c32$counts)
+y.sc6 <- y.keep[,geno=="SC6"]
+y.sc6$samples$lib.size <- colSums(y.sc6$counts)
+```
+
+# C32 data analysis
+## Sample and gene filtering
+
+We removed one sample that had failed and filtered out lowly expressed genes.
+
+```{r}
+# Remove dodgy sample
+bad.sample.id <- which(colnames(y.c32)=="PE1613_C32_Day_18_2_S18")
+y.c32.keep <- y.c32[,-bad.sample.id]
+targets.c32 <- targets.c32[-bad.sample.id,]
+table(targets.c32$Sample==colnames(y.c32.keep))
+```
+
+```{r}
+# gene filtering
+nc <- cpm(y.c32.keep)
+keep <- rowSums(nc >= 1) >= 2
+y.c32.keep <- y.c32.keep[keep,]
+```
+
+### Add gene annotation
+
+```{r}
+# Getting some annotation
+symbol <- toTable(org.Hs.egSYMBOL)
+alias <- alias2SymbolTable(rownames(y.c32.keep),species="Hs")
+m <- match(alias,symbol$symbol)
+ann <- data.frame(Original_symbol=rownames(y.c32.keep),symbol[m,])
+alias2 <- toTable(org.Hs.egALIAS2EG)
+m <- match(ann$gene_id,alias2$gene_id)
+ann$alias <- alias2$alias_symbol[m]
+gene_name <- toTable(org.Hs.egGENENAME)
+m <- match(ann$gene_id,gene_name$gene_id)
+ann$gene_name <- gene_name$gene_name[m]
+chr <- toTable(org.Hs.egCHR)
+m <- match(ann$gene_id,chr$gene_id)
+ann$chr <- chr$chromosome[m]
+rownames(ann) <- ann$Original_symbol
+ann$length <- run1$Length[match(rownames(y.c32.keep),run1$Geneid)]
+
+y.c32.keep$genes <- ann
+```
+
+### Remove ribosomal and mitochondrial genes
+```{r}
+ribo <- grep("ribosomal",y.c32.keep$genes$gene_name)
+mito <- grep("mitochondrial",y.c32.keep$genes$gene_name)
+pseudo <- grep("pseudogene",y.c32.keep$genes$gene_name)
+junk <- unique(c(ribo,mito,pseudo))
+
+y.c32.keep <- y.c32.keep[-junk,]
+
+# Get rid of genes without Entrez gene id/gene annotation
+y.c32.keep <- y.c32.keep[!is.na(y.c32.keep$genes$gene_id),]
+y.c32.keep$samples$lib.size <- colSums(y.c32.keep$counts)
+
+```
+
+## Normalisation
+
+We performed TMM normalisation.
+
+```{r}
+# TMM normalisation
+y.c32.keep$samples$lib.size <- colSums(y.c32.keep$counts)
+y.c32.keep <- calcNormFactors(y.c32.keep)
+```
+
+# Separate into Day 18 data
+
+```{r}
+y.c32.d18 <- y.c32.keep[,targets.c32$age==18]
+targets.c32.d18 <- targets.c32[targets.c32$age==18,]
+
+# Add Batch information
+targets.c32.d18$Batch <- targets.c32.d18$vial
+targets.c32.d18$Batch[targets.c32.d18$vial==3 | targets.c32.d18$vial==4 | targets.c32.d18$vial==5] <- 3
+targets.c32.d18$Batch[targets.c32.d18$vial==6] <- 1
+targets.c32.d18$Batch[targets.c32.d18$vial==10] <- 4
+targets.c32.d18$Batch[targets.c32.d18$vial==11] <- 5
+targets.c32.d18$Batch[targets.c32.d18$vial==1] <- 2
+
+# Relabel vial within c32 Day 18
+targets.c32.d18$vial2 <- targets.c32.d18$vial
+targets.c32.d18$vial2[targets.c32.d18$vial==6] <- 1
+targets.c32.d18$vial2[targets.c32.d18$vial==10] <- 6
+targets.c32.d18$vial2[targets.c32.d18$vial==11] <- 7
+targets.c32.d18$vial2[targets.c32.d18$vial==1] <- 2
+```
+
+## Correlation between organoids
+
+```{r}
+logcpm <- cpm(y.c32.d18,log=TRUE)
+mypal <- brewer.pal(9,"YlOrRd")
+morecols <- colorRampPalette(mypal)
+cors <- cor(logcpm,method="spearman")
+
+mean(cors[upper.tri(cors)])
+
+
+group2 <- paste("Batch",targets.c32.d18$Batch,"Exp",targets.c32.d18$vial2,sep="")
+aheatmap(cors,col=morecols(50),labRow = group2,labCol = group2,annCol =list(Batch=factor(targets.c32.d18$Batch),Exp= factor(targets.c32.d18$vial2)))
+```
+
+## Correlation within batches/experiments
+
+```{r}
+cor.b1 <- cor(logcpm[,targets.c32.d18$Batch==1],method="spearman")
+a1 <- mean(cor.b1[upper.tri(cor.b1)])
+cor.b2 <- cor(logcpm[,targets.c32.d18$Batch==2],method="spearman")
+a2 <- mean(cor.b2[upper.tri(cor.b2)])
+cor.b3 <- cor(logcpm[,targets.c32.d18$Batch==3],method="spearman")
+a3 <- mean(cor.b3[upper.tri(cor.b3)])
+cor.b4 <- cor(logcpm[,targets.c32.d18$Batch==4],method="spearman")
+a4 <- mean(cor.b4[upper.tri(cor.b4)])
+cor.b5 <- cor(logcpm[,targets.c32.d18$Batch==5],method="spearman")
+a5 <- mean(cor.b5[upper.tri(cor.b5)])
+mean(c(a1,a2,a3,a4,a5))
+
+mean(cor(logcpm[,targets.c32.d18$Batch==3],logcpm[,targets.c32.d18$Batch!=3],method="spearman"))
+
+cor.nob3 <- cor(logcpm[,targets.c32.d18$Batch!=3],method="spearman")
+mean(cor.nob3[upper.tri(cor.nob3)])
+```
+
+## Normalisation and dispersion estimation for Day 18 samples
+
+```{r}
+y.c32.d18 <- calcNormFactors(y.c32.d18)
+des.d18 <- model.matrix(~targets.c32.d18$vial2)
+y.c32.d18 <- estimateDisp(y.c32.d18,design = des.d18,robust=TRUE)
+```
+
+```{r}
+par(mfrow=c(1,2))
+par(mar=c(4.5,4.5,2,2))
+plotMDS(y.c32.d18,col=ggplotColors(5)[factor(targets.c32.d18$Batch)],pch=c(1:6,8)[factor(targets.c32.d18$vial2)],cex=2,cex.lab=1.5,cex.axis=1.5)
+legend("topright",legend=paste("Batch",levels(factor(targets.c32.d18$Batch))),fill=ggplotColors(5),cex=1.2)
+legend("bottom",legend=paste("Vial",levels(factor(targets.c32.d18$vial2))),pch=c(1:6,8),cex=1.2)
+plotMDS(y.c32.d18,col=ggplotColors(5)[factor(targets.c32.d18$Batch)],pch=c(1:6,8)[factor(targets.c32.d18$vial2)],cex=2,dim=c(2,3),cex.lab=1.5,cex.axis=1.5)
+```
+
+## Analysing the different variance components
+
+We used a random effects model and included two levels: batch and vial. This was performed using the lmer package.
+
+```{r}
+logy <- cpm(y.c32.d18,log=TRUE,prior.count=0.5)
+SDComp <- matrix(0,ncol=3,nrow=nrow(logy))
+colnames(SDComp) <- c("VarVial","VarBatch","VarRes")
+rownames(SDComp) <- rownames(y.c32.d18)
+Amean <- rowMeans(logy)
+```
+
+```{r}
+for(i in 1:nrow(logy)){
+test <- lmer(logy[i,]~(1|targets.c32.d18$Batch)+(1|targets.c32.d18$vial2))
+SDComp[i,] <- c(unlist(VarCorr(test)),sigma(test))
+}
+VarComp <- SDComp
+VarComp[,3] <- SDComp[,3]^2
+TotVar <- rowSums(VarComp)
+PropVar <- VarComp/TotVar
+colnames(PropVar) <- c("PropVial","PropBatch","PropRes")
+```
+
+```{r}
+MaxVar <- apply(PropVar,1,function(x) names(which.max(x)))
+```
+
+```{r}
+results <- data.frame(y.c32.d18$genes,AvgLogCPM=Amean,PropVar,VarComp,TotVar=TotVar,MaxVarExplained=MaxVar,stringsAsFactors = FALSE)
+o <- order(results$TotVar,decreasing=TRUE)
+results <- results[o,]
+```
+ 
+### Figures
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(2,2,2,2))
+pie(table(results$MaxVarExplained[1:1000]),col=ggplotColors(3),labels = c("Batch","Residual","Vial"),cex=1.2)
+title("Top 1000 most variable genes",cex.main=2)
+```
+
+### Figure 2d 
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4,5,2,2))
+boxplot(sqrt(VarComp),ylab=expression(sqrt("Variance Component")),cex.axis=1.5,cex.lab=1.5,names=c("Vial","Batch","Residual"),ylim=c(0,4))
+```
+
+### Supplementary Figure 5
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4,4,2,2))
+log.d18 <- normCounts(y.c32.d18,log=TRUE,prior.count=1)
+aheatmap(log.d18[rownames(results)[1:50],],labCol=group2,
+         annCol =list(Batch=factor(targets.c32.d18$Batch),
+                      Exp= factor(targets.c32.d18$vial2)))
+```
+
+###Figure 2e
+```{r}
+# Show expression stripcharts 
+top10.var <- rownames(results)[1:10]
+newcol <- c(1,ggplotColors(4)[1],1,ggplotColors(4)[2:4])
+batchf <- factor(targets.c32.d18$Batch,levels=c("3","1","4","5","2"))
+par(mar=c(4,5,3,2))
+par(mfrow=c(2,4))
+for(i in 1:8){
+stripchart(log.d18[top10.var[i],]~targets.c32.d18$Batch,vertical=TRUE,pch=16,method="jitter",col=newcol[-1],
+           main=top10.var[i],cex=3,xlab="Batch",
+           ylab="Log-normalised-expression",
+           cex.axis=1.35,cex.lab=1.35)
+}
+```
+
+```{r}
+y.ts <- y.c32.keep[,targets.c32$vial==1 | targets.c32$vial==2]
+y.ts <- calcNormFactors(y.ts)
+logcpm.ts <- cpm(y.ts,log=TRUE)
+
+```
+###Figure 3a
+```{r}
+#Most variable genes in the time course data
+par(mfrow=c(1,1))
+logts <- normCounts(y.ts,log=TRUE,prior.count=1)
+aheatmap(logts[rownames(results)[1:50],c(4:6,1:3,7:12)],
+         labCol=targets.ts$Time[c(4:6,1:3,7:12)],
+         main="Top 50 most variable genes",
+         Colv=NA)
+```
+
+## Estimate the age of the C32 organoids
+
+Here we use the time series data as a baseline to compare against in order to predict the age of the organoids from Batches 1, 3, 4 and 5.
+
+```{r}
+class(targets.ts$Time)
+des.ts <- model.matrix(~targets.ts$Time[1:12])
+y.orig.ts <- y.ts[,1:12]
+
+keep <- rowSums(cpm(y.orig.ts)>=1)>=3
+y.orig.ts <- y.orig.ts[keep,]
+
+# TMM normalisation
+y.orig.ts$samples$lib.size <- colSums(y.orig.ts$counts)
+y.orig.ts <- calcNormFactors(y.orig.ts)
+
+v.ts <- voom(y.orig.ts,design=des.ts,plot=TRUE)
+```
+
+```{r}
+# Linear model to find top DE genes for development
+fit.ts <- lmFit(v.ts)
+fit.ts <- eBayes(fit.ts)
+top.ts <- topTable(fit.ts,coef=2)
+genes <- rownames(top.ts)
+```
+
+```{r}
+# LogCPMs
+logts <- cpm(y.orig.ts,log=TRUE)
+```
+
+### Figure 3
+
+```{r}
+# Make plots of the genes
+mytime <- factor(targets.ts$Time[1:12],levels=c("7","10","18","25"))
+par(mar=c(5,5,2,2))
+par(mfrow=c(2,5))
+for(i in 1:10){
+stripchart(logts[genes[i],]~mytime,vertical=TRUE,pch=16,method="jitter",cex=1.5,xlab="Day",ylab="LogCPM",main=genes[i],cex.lab=1.5,cex.axis=1.5)
+}
+```
+
+```{r}
+# Get data frame ready for linear model
+model.data <- data.frame(age=targets.ts$Time[1:12],t(logts[genes,]))
+
+mymodel <- lm(model.data$age~model.data[,2]+model.data[,3]+model.data[,4]+model.data[,5]+model.data[,6]+model.data[,7]+model.data[,8]+model.data[,9]+model.data[,10]+model.data[,11])
+
+```
+
+```{r}
+# new data
+colnames(y.c32.d18)
+lognew <- cpm(y.c32.d18,log=TRUE)
+
+# data for prediction
+datapred <- lognew[genes,]
+
+predAge <- rep(NA,ncol(datapred))
+names(predAge) <- colnames(datapred)
+
+for(i in 1:length(predAge)) predAge[i] <- mymodel$coeff %*% as.numeric(c(1,datapred[,i]))
+```
+
+```{r}
+m <- match(names(predAge),targets.c32$Sample)
+targets.c32$predAge <- targets.c32$age
+targets.c32$predAge[m] <- round(predAge,digits=2)
+targets.c32$vial2 <- targets.c32$vial
+m <- match(targets.c32.d18$Sample,targets.c32$Sample)
+targets.c32$vial2[m] <- targets.c32.d18$vial2
+targets.c32$Batch <- 0
+targets.c32$Batch[m] <- targets.c32.d18$Batch
+targets.c32$Batch[targets.c32$vial==10] <- 4
+targets.c32$Batch[targets.c32$vial==11] <- 5
+targets.c32$Batch[targets.c32$vial==1] <- 1
+```
+
+```{r}
+cols <- ggplotColors(6)
+par(mfrow=c(1,1))
+plotMDS(y.c32.keep,labels=targets.c32$predAge,col=ggplotColors(8)[factor(targets.c32$vial)],ndim=3,cex=1,cex.lab=1.5,cex.axis=1.5)
+par(mfrow=c(1,2))
+par(mar=c(4.5,4.5,2,2))
+plotMDS(y.c32.keep,labels=targets.c32$age,col=cols[c(2,1,3,4,5,6)][factor(targets.c32$Batch)],cex=2,cex.lab=1.5,cex.axis=1.5)
+legend("topright",legend=paste("Batch",levels(factor(targets.c32$Batch))),fill=cols[c(2,1,3,4,5,6)],cex=1.5)
+batch <- factor(targets.c32.d18$Batch,levels=c(1,2,3,4,5))
+```
+
+### Figure 3
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4.5,4.5,2,2))
+stripchart(predAge~batch,vertical=TRUE,pch=16,method="jitter",col=newcol[-1],cex=2,xlab="Batch",cex.lab=1.5,ylab="Predicted age",cex.axis=1.5)
+```
+
+# Data analysis of the SC6 data
+
+```{r}
+dim(y.sc6)
+dim(targets.sc6)
+targets.sc6$vial2 <- targets.sc6$vial
+targets.sc6$vial2[targets.sc6$vial==7] <- 1
+targets.sc6$vial2[targets.sc6$vial==8] <- 2
+targets.sc6$vial2[targets.sc6$vial==9] <- 3
+```
+
+
+```{r}
+# gene filtering
+nc.sc6 <- cpm(y.sc6)
+keep <- rowSums(nc.sc6 >= 1) >= 2
+y.sc6.keep <- y.sc6[keep,]
+```
+
+## Add gene annotation
+
+```{r}
+# Getting some annotation
+symbol <- toTable(org.Hs.egSYMBOL)
+alias <- alias2SymbolTable(rownames(y.sc6.keep),species="Hs")
+m <- match(alias,symbol$symbol)
+ann <- data.frame(Original_symbol=rownames(y.sc6.keep),symbol[m,])
+alias2 <- toTable(org.Hs.egALIAS2EG)
+m <- match(ann$gene_id,alias2$gene_id)
+ann$alias <- alias2$alias_symbol[m]
+gene_name <- toTable(org.Hs.egGENENAME)
+m <- match(ann$gene_id,gene_name$gene_id)
+ann$gene_name <- gene_name$gene_name[m]
+chr <- toTable(org.Hs.egCHR)
+m <- match(ann$gene_id,chr$gene_id)
+ann$chr <- chr$chromosome[m]
+rownames(ann) <- ann$Original_symbol
+
+y.sc6.keep$genes <- ann
+```
+
+### Remove ribosomal and mitochondrial genes
+```{r}
+ribo <- grep("ribosomal",y.sc6.keep$genes$gene_name)
+mito <- grep("mitochondrial",y.sc6.keep$genes$gene_name)
+pseudo <- grep("pseudogene",y.sc6.keep$genes$gene_name)
+junk <- unique(c(ribo,mito,pseudo))
+
+y.sc6.keep <- y.sc6.keep[-junk,]
+
+# Get rid of genes without Entrez gene id/gene annotation
+y.sc6.keep <- y.sc6.keep[!is.na(y.sc6.keep$genes$gene_id),]
+y.sc6.keep$samples$lib.size <- colSums(y.sc6.keep$counts)
+
+```
+
+# TMM normalisation
+
+```{r}
+y.sc6.keep <- calcNormFactors(y.sc6.keep)
+```
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4.5,4.5,2,2))
+plotMDS(y.sc6.keep,labels=targets.sc6$age,col=ggplotColors(3)[factor(targets.sc6$vial2)],cex=1.5)
+legend("bottom",legend = paste("Vial",levels(factor(targets.sc6$vial2))),fill=ggplotColors(3))
+```
+
+
+# Estimate dispersion
+
+```{r}
+des.sc6 <- model.matrix(~factor(targets.sc6$age))
+y.sc6.keep <- estimateDisp(y.sc6.keep,design=des.sc6,robust=TRUE)
+```
+
+```{r}
+big <- (y.sc6.keep$tagwise.dispersion)^0.5 > 0.5
+plot(y.sc6.keep$AveLogCPM[!big],(y.sc6.keep$tagwise.dispersion[!big])^0.5,pch=16,cex=0.5,ylim=c(0,max((y.sc6.keep$tagwise.dispersion)^0.5)))
+text(y.sc6.keep$AveLogCPM[big],(y.sc6.keep$tagwise.dispersion[big])^0.5,labels=rownames(y.sc6.keep)[big],col=2,cex=0.8)
+```
+
+
+```{r}
+lcpm.sc6 <- cpm(y.sc6.keep,log=TRUE)
+cors.sc6 <- cor(lcpm.sc6,method="spearman")
+label.sc6 <- paste("Day",targets.sc6$age,sep="")
+par(mfrow=c(1,1))
+aheatmap(cors.sc6,labRow = label.sc6,labCol = label.sc6,annCol=list(Vial=factor(targets.sc6$vial2)))
+```
+
+
+# Separate D18 data
+```{r}
+y.sc6.d18 <- y.sc6.keep[,targets.sc6$age==18]
+targets.sc6.d18 <- targets.sc6[targets.sc6$age==18,]
+```
+
+```{r}
+plotMDS(y.sc6.d18,pch=16,cex=2,col=ggplotColors(3)[factor(targets.sc6.d18$vial2)])
+legend("topleft",legend=paste("Vial",levels(factor(targets.sc6.d18$vial2))),fill=ggplotColors(3))
+title("SC6 day 18 only")
+```
+
+
+## Correlation between SC6 D18 organoids
+```{r}
+logcpm <- cpm(y.sc6.d18,log=TRUE)
+mypal <- brewer.pal(9,"YlOrRd")
+morecols <- colorRampPalette(mypal)
+cors <- cor(logcpm,method="spearman")
+
+par(mfrow=c(1,1))
+aheatmap(cors,col=morecols(50),labRow = paste("Vial", targets.sc6.d18$vial2),labCol = paste("Vial", targets.sc6.d18$vial2),main="Pairwise sample correlations",Rowv=NA,Colv=NA)
+```
+
+
+```{r}
+cors.all <- cor(cpm(y.sc6.keep,log=TRUE),method="spearman")
+labs <- paste("Day", targets.sc6$age,"Vial", targets.sc6$vial)
+aheatmap(cors.all,labRow=labs,labCol = labs,main="SC6: Pairwise sample correlations")
+```
+
+```{r}
+logcpm.sc6 <- cpm(y.sc6.keep,log=TRUE)
+cor.d0 <- cor(logcpm.sc6[,targets.sc6$age==0],method="spearman")
+a.d0 <- mean(cor.d0[upper.tri(cor.d0)])
+
+cor.d7 <- cor(logcpm.sc6[,targets.sc6$age==7],method="spearman")
+a.d7 <- mean(cor.d7[upper.tri(cor.d7)])
+
+cor.d18 <- cor(logcpm.sc6[,targets.sc6$age==18],method="spearman")
+a.d18 <- mean(cor.d18[upper.tri(cor.d18)])
+
+mean(a.d0,a.d7,a.d18)
+
+mean(cor(logcpm[,targets.sc6.d18$vial2==1],logcpm[,targets.sc6.d18$vial2!=1],method="spearman"))
+mean(cor(logcpm[,targets.sc6.d18$vial2==2],logcpm[,targets.sc6.d18$vial2!=2],method="spearman"))
+mean(cor(logcpm[,targets.sc6.d18$vial2==3],logcpm[,targets.sc6.d18$vial2!=3],method="spearman"))
+```
+
+# Using lmer to fit a random effects model
+
+```{r}
+logy.sc6 <- cpm(y.sc6.d18,log=TRUE,prior.count=0.5)
+SDComp.sc6 <- matrix(0,ncol=2,nrow=nrow(logy.sc6))
+colnames(SDComp.sc6) <- c("VarVial","VarRes")
+rownames(SDComp.sc6) <- rownames(y.sc6.d18)
+Amean.sc6 <- rowMeans(logy.sc6)
+```
+
+```{r}
+for(i in 1:nrow(logy.sc6)){
+test <- lmer(logy.sc6[i,]~(1|targets.sc6.d18$vial))
+SDComp.sc6[i,] <- c(unlist(VarCorr(test)),sigma(test))
+}
+# Check this is correct
+VarComp.sc6 <- SDComp.sc6
+VarComp.sc6[,2] <- SDComp.sc6[,2]^2
+TotVar.sc6 <- rowSums(VarComp.sc6)
+PropVar.sc6 <- VarComp.sc6/TotVar.sc6
+colnames(PropVar.sc6) <- c("PropVial","PropRes")
+```
+
+```{r}
+MaxVar.sc6 <- apply(PropVar.sc6,1,function(x) names(which.max(x)))
+```
+
+```{r}
+results.sc6 <- data.frame(y.sc6.d18$genes,AvgLogCPM=Amean.sc6,PropVar.sc6,VarComp.sc6,TotVar=TotVar.sc6,MaxVarExplained=MaxVar.sc6,stringsAsFactors = FALSE)
+o <- order(results.sc6$TotVar,decreasing=TRUE)
+results.sc6 <- results.sc6[o,]
+```
+
+```{r}
+write.csv(results.sc6,file="VarCompResults-SC6-06092018.csv",row.names=FALSE)
+```
+
+
+### Figure 5e
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4,5,2,2))
+boxplot(sqrt(VarComp.sc6),ylab=expression(sqrt("Variance Component")),cex.axis=1.5,cex.lab=1.5,names=c("Vial","Residual"),ylim=c(0,1.5))
+```
+
+# SC6 variability plots
+
+```{r}
+par(mar=c(4.5,4.5,3,2))
+par(mfrow=c(1,1))
+plot(logcpm[,"PE1613.3_SC6_Day_18_1_S12"],
+     logcpm[,"PE1613.3_SC6_Day_18_2_S13"],
+     ylab="LogCPM: Day 18 Vial 3 Replicate 2",
+     xlab="LogCPM: Day 18 Vial 3 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation within vial")
+abline(a=0,b=1,col=2,lwd=2)
+text(0,13,labels = paste("Spearman correlation = ", round(cor(logcpm[,"PE1613.3_SC6_Day_18_1_S12"], logcpm[,"PE1613.3_SC6_Day_18_2_S13"],method="spearman"),digits=3)),cex=1.2)
+
+
+par(mar=c(4.5,4.5,3,2))
+par(mfrow=c(1,1))
+plot(logcpm[,"PE1613.1_SC6_Day_18_1_S4"],
+     logcpm[,"PE1613.3_SC6_Day_18_2_S13"],
+     ylab="LogCPM: Day 18 Vial 3 Replicate 2",
+     xlab="LogCPM: Day 18 Vial 1 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation between vials")
+abline(a=0,b=1,col=2,lwd=2)
+text(0,13,labels = paste("Spearman correlation = ", round(cor(logcpm[,"PE1613.1_SC6_Day_18_1_S4"], logcpm[,"PE1613.3_SC6_Day_18_2_S13"],method="spearman"),digits=3)),cex=1.2)   
+```
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(2,2,2,2))
+pie(table(results.sc6$MaxVarExplained[1:100]),col=ggplotColors(2),cex=1.2)
+title("Top 100 most variable genes",cex.main=2)
+```
+
+
+```{r}
+par(mfrow=c(1,1))
+vialf <- factor(targets.sc6.d18$vial2)
+o <- order(vialf)
+aheatmap(logcpm[rownames(results.sc6)[1:50],o],labCol=paste("Vial",targets.sc6.d18$vial2[o]),annCol = list(Vial=vialf[o]),fontsize = 14)
+```
+
+# GO analysis of variable genes
+```{r}
+# Top 100 most variable
+length <- run1$Length[match(rownames(y.sc6.d18),run1$Geneid)]
+topGO(goana(de=results.sc6$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length))
+
+# Top 100 most variable vial-vial
+results.sc6.vial <- results.sc6[results.sc6$MaxVarExplained=="PropVial",]
+write.csv(topGO(goana(de=results.sc6.vial$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="sc6-vialgenes-GO.csv")
+
+
+# top 100 most variable residual
+results.sc6.res <- results.sc6[results.sc6$MaxVarExplained=="PropRes",]
+write.csv(topGO(goana(de=results.sc6.res$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="sc6-residgenes-GO.csv")
+
+```
+
+# Figure of GO results
+
+```{r}
+go.sc6.vial <- goana(de=results.sc6.vial$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)
+
+go.sc6.res <- goana(de=results.sc6.res$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)
+```
+
+
+```{r}
+par(mfrow=c(2,1))
+par(mar=c(5,20,2,2))
+o <- order(go.sc6.vial$P.DE)
+o.go.sc6.vial <- go.sc6.vial[o,]
+o.go.sc6.vial <- o.go.sc6.vial[o.go.sc6.vial$N>9,]
+scores <- -log10(o.go.sc6.vial$P.DE[1:10])
+names(scores) <- o.go.sc6.vial$Term[1:10]
+
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(2)[1],cex.names = 1.5,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="Vial-vial variability",cex.main=1.8)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+par(mar=c(5,26,2,2))
+o <- order(go.sc6.res$P.DE)
+o.go.sc6.res <- go.sc6.res[o,]
+o.go.sc6.res <- o.go.sc6.res[o.go.sc6.res$N>9,]
+scores <- -log10(o.go.sc6.res$P.DE[1:10])
+names(scores) <- o.go.sc6.res$Term[1:10]
+
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(2)[2],cex.names = 1.5,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="Residual variability",cex.main=1.8)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+```
+
+############## CHECK FROM HERE ########################
+
+# Analyse two cell lines together
+
+```{r}
+dim(y.keep)
+dim(targets.all)
+table(targets.all$Sample==colnames(y.keep))
+
+# Remove doddgy sample
+y.keep2 <- y.keep[,-42]
+targets.all2 <- targets.all[-42,]
+
+
+# Add Batch information
+targets.all2$Batch <- targets.all2$vial
+targets.all2$Batch[targets.all2$vial==3 | targets.all2$vial==4 | targets.all2$vial==5] <- 3
+targets.all2$Batch[targets.all2$vial==6] <- 1
+targets.all2$Batch[targets.all2$vial==10] <- 4
+targets.all2$Batch[targets.all2$vial==11] <- 5
+targets.all2$Batch[targets.all2$vial==1] <- 2
+targets.all2$Batch[targets.all2$vial==7 | targets.all2$vial==8 | targets.all2$vial==9] <- 6
+```
+
+```{r}
+## Correlation heatmap (figure 4)
+logcpm.all <- cpm(y.keep2,log=TRUE)
+mypal <- brewer.pal(9,"YlOrRd")
+morecols <- colorRampPalette(mypal)
+cors.all <- cor(logcpm.all,method="spearman")
+
+mean(cors.all[upper.tri(cors.all)])
+
+group.all <- paste(targets.all2$geno,targets.all2$age)
+par(mfrow=c(1,1))
+aheatmap(cors.all,labRow=group.all,labCol=group.all)
+
+# order samples
+grp.all <- paste("Day",targets.all2$age,"B",targets.all2$Batch,sep="")
+grp.all <- factor(grp.all,levels=c("Day0B2","Day0B6","Day4B2","Day7B4",
+                                   "Day7B5","Day7B2","Day7B6","Day10B2",
+                                   "Day18B3","Day18B6","Day18B1","Day18B4",
+                                   "Day18B5","Day18B2","Day25B2"))
+targets.all2$geno2 <- targets.all2$geno
+targets.all2$geno2[targets.all2$geno=="C32"] <- "CRL1502-C32"
+targets.all2$geno2[targets.all2$geno=="SC6"] <- "RG_0019.0149.C6"
+
+o <- order(grp.all)
+grp.all[o]
+aheatmap(cors.all[o,o],labRow=paste("Day",targets.all2$age)[o],labCol=paste("Day",targets.all2$age)[o],Colv = NA,Rowv = NA,
+         annCol=list(CellLine=targets.all2$geno2[o]))
+  
+```
+
+```{r}
+# Hierarchical clustering with heatmaps
+# find most variable genes
+sd <- apply(logcpm.all,1,sd)
+var.genes <- names(sort(sd,decreasing=TRUE))
+aheatmap(logcpm.all[var.genes[1:50],],labCol=group.all)
+```
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(5,5,2,2))
+dd <- dist(t(logcpm.all[var.genes[1:100],]))
+plot(hclust(dd),labels=group.all)
+```
+
+```{r}
+design.all <- model.matrix(~0+grp.all)
+colnames(design.all) <- levels(grp.all)
+v.all <- voom(y.keep2,design=design.all,plot=TRUE)
+
+fit <- lmFit(v.all,design.all)
+contr <- makeContrasts(sc6vc32=Day18B6-Day18B3,
+                       d18v10=Day18B2-Day10B2,
+                       levels=design.all)
+fit.contr <- contrasts.fit(fit,contrasts = contr)
+fit.contr <- eBayes(fit.contr,robust=TRUE)
+summary(decideTests(fit.contr))
+
+fit.treat <- treat(fit.contr,lfc=1,robust=TRUE)
+res <- decideTests(fit.treat)
+summary(res)
+topTreat(fit.treat,coef=1)
+topTreat(fit.treat,coef=2)
+
+vennDiagram(decideTests(fit.treat))
+plot(fit.treat$coefficients[,1],fit.treat$coefficients[,2])
+abline(h=0,v=0)
+
+up.genes <- rownames(res)[res[,1]==1]
+dn.genes <- rownames(res)[res[,1]== -1]
+
+pdf(file="Z:/Group-Little_MCRI/Manuscripts/In Progress/Phipson 2017 Organoid transcriptional profiling/Figure6/barcodeplot-sc6vsc32.pdf",height = 5,width=8)
+barcodeplot(fit.treat$t[,2],index=match(up.genes,rownames(fit.treat)),
+            index2=match(dn.genes,rownames(fit.treat)))
+dev.off()
+
+roast(v.all,index=match(up.genes,rownames(fit.treat)),design=design.all,contrast = contr[,2],nrot=9999)
+
+roast(v.all,index=match(dn.genes,rownames(fit.treat)),design=design.all,contrast = contr[,2],nrot=9999)
+```
+
+```{r}
+# Heatmap with DE genes from day18 vs day 10
+y.all.d18 <- y.keep2[,targets.all2$age==18]
+targets.all.d18 <- targets.all2[targets.all2$age==18,]
+
+de.genes.ts <- rownames(topTreat(fit.treat,coef=2,n=Inf))[1:100]
+
+logcpm.d18 <- cpm(y.all.d18,log=TRUE)
+
+par(mfrow=c(1,1))
+par(mar=c(5,5,5,2))
+aheatmap(logcpm.d18[de.genes.ts,],labCol=targets.all.d18$geno2,annCol=list(Batch=factor(targets.all.d18$Batch),CellLine=factor(targets.all.d18$geno2)),fontsize = 14,main="All day 18 organoids",labRow=NA)
+
+o <- order(grp.all)
+aheatmap(logcpm.all[de.genes.ts,o],labCol=targets.all2$age[o],annCol=list(Batch=factor(targets.all2$Batch[o]),geno=targets.all2$geno2[o]),fontsize = 12,Colv = NA)
+```
+
+# Add epithelial sorted organoid samples
+
+```{r}
+# NPHP3 data
+counts.nphp3 <- read.delim("D:/_MCRI/_Analysis projects/MelissaLittle/NPHP3_disease_modelling/counts.txt",skip=1,header=TRUE)
+targets.nphp3 <- read.table("D:/_MCRI/_Analysis projects/MelissaLittle/NPHP3_disease_modelling/targets.txt",header=TRUE,stringsAsFactors=FALSE)
+data.nphp3 <- counts.nphp3[,16:18]
+rownames(data.nphp3) <- counts.nphp3$Geneid
+```
+
+## Add new data
+ 
+```{r}
+y.c32.sc6.nphp3 <- DGEList(cbind(ts[,-(1:6)],early[,-(1:6)],data,counts,data.nphp3))
+keep <- rowSums(cpm(y.c32.sc6.nphp3)>=1)>=2
+y.c32.sc6.nphp3.keep <- y.c32.sc6.nphp3[keep,]
+y.c32.sc6.nphp3.keep$samples$lib.size <- colSums(y.c32.sc6.nphp3.keep$counts)
+
+geno.all <- c(geno,"SC6-EPCAM","SC6-EPCAM","SC6-EPCAM")  
+age.all <- c(age,25,25,25)
+
+par(mfrow=c(1,2))  
+plotMDS(y.c32.sc6.nphp3.keep[,-42],pch=c(16,2,6)[factor(geno.all[-42])],col=ggplotColors(6)[factor(age.all[-42])],cex=2,cex.lab=1.5,cex.axis=1.5)
+legend("topleft",legend=paste("Day",levels(factor(age.all))),col=ggplotColors(6),pch=16,cex=1)
+legend("top",legend=c("CRL1502-C32","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,2,6),cex=1,bg="n",bty="n")
+plotMDS(y.c32.sc6.nphp3.keep[,-42],pch=c(16,2,6)[factor(geno.all[-42])],col=ggplotColors(6)[factor(age.all[-42])],cex=2,cex.lab=1.5,cex.axis=1.5,dim=c(3,4))
+legend("bottomleft",legend=paste("Day",levels(factor(age.all))),col=ggplotColors(6),pch=16,cex=1)
+legend("top",legend=c("CRL1502-C32","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,2,6),cex=1,bg="n",bty="n")
+```
+
+```{r}
+# Lorna's data which is mapped to hg38
+# Replace data.lorna with hg19 mapped counts
+#data.lorna <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/aligned_reads_star/counts_gencodeV20.txt",skip=1,header=TRUE)
+
+data.hg19 <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/aligned_reads_star_hg19/counts_hg19.txt",skip=1,header=TRUE)
+
+counts.lorna <- data.hg19[,-(1:6)]
+rownames(counts.lorna) <- data.hg19[,1]
+colnames(counts.lorna) <- gsub("_ML170410_170322_HCVCFBGX2_NB501544_L000_Aligned.sortedByCoord.out.bam","",colnames(counts.lorna))
+colnames(counts.lorna) <- gsub("_ML170411_170323_HCTFWBGX2_NB501544_L000_Aligned.sortedByCoord.out.bam","",colnames(counts.lorna))
+
+targets.lorna <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/analysis/targets.txt",stringsAsFactors = FALSE,sep="\t")
+
+counts.c32.ltl <- counts.lorna[,targets.lorna$CellType=="C32" & targets.lorna$Source=="LTL"]
+
+table(rownames(counts.c32.ltl) == rownames(y.c32.sc6.nphp3))
+
+m <- match(rownames(y.c32.sc6.nphp3),rownames(counts.c32.ltl))
+
+y.c32.sc6.nphp3.ltl <- DGEList(cbind(ts[!is.na(m),-(1:6)],early[!is.na(m),-(1:6)],data[!is.na(m),],counts[!is.na(m),],data.nphp3[!is.na(m),],counts.c32.ltl[m[!is.na(m)],]))
+rownames(y.c32.sc6.nphp3.ltl) <- rownames(counts.c32.ltl[m[!is.na(m)],])
+
+keep <- rowSums(cpm(y.c32.sc6.nphp3.ltl)>=1)>=2
+y.c32.sc6.nphp3.ltl.keep <- y.c32.sc6.nphp3.ltl[keep,]
+y.c32.sc6.nphp3.ltl.keep$samples$lib.size <- colSums(y.c32.sc6.nphp3.ltl.keep$counts)
+
+geno.all.ltl <- c(geno.all,"C32-LTL","C32-LTL","C32-LTL")  
+age.all.ltl <- c(age.all,25,25,25)
+```
+
+```{r}
+par(mfrow=c(1,2))
+par(mar=c(4.5,4.5,2,2))
+plotMDS(y.c32.sc6.nphp3.ltl.keep[,-42],pch=c(16,1,2,6)[factor(geno.all.ltl[-42])],col=ggplotColors(6)[factor(age.all.ltl[-42])],cex=2,cex.lab=1.5,cex.axis=1.5)
+title("Samples cluster by time points",cex.main=1.5)
+legend(1.8,3.75,legend=paste("Day",levels(factor(age.all.ltl))),col=ggplotColors(6),pch=16,cex=1.25)
+legend("topleft",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),cex=1.15,bg="n",bty="n")
+plotMDS(y.c32.sc6.nphp3.ltl.keep[,-42],pch=c(16,1,2,6)[factor(geno.all.ltl[-42])],col=ggplotColors(6)[factor(age.all.ltl[-42])],cex=2,cex.lab=1.5,cex.axis=1.5,dim=c(3,4))
+title("Epithelial fraction separates from organoids",cex.main=1.5)
+legend("bottomright",legend=paste("Day",levels(factor(age.all.ltl))),col=ggplotColors(6),pch=16,cex=1.25)
+legend("topleft",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),cex=1.15,bg="n",bty="n")
+```
+
+
+```{r}
+# Show expression of epithelial and interstitial genes
+epi <- c("CDH1","SLC3A1","JAG1","EPCAM","CUBN")
+stroma <- c("MEIS1","FOXD1","SMOC2","SNAI2","TGFB1I1")
+lcpm.org.epi <- cpm(y.c32.sc6.nphp3.ltl.keep[,-42],log=TRUE)
+
+samples.all <- paste(geno.all.ltl[-42],"Day",age.all.ltl[-42],sep="")
+samples.all <- factor(samples.all,levels=c("C32Day0","SC6Day0","C32Day4","C32Day7","SC6Day7","C32Day10","C32Day18","SC6Day18","C32Day25","C32-LTLDay25","SC6-EPCAMDay25"))
+
+pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/Figure6/epithelial-stroma-genes-hg19-updated.pdf",height = 10,width=22)
+par(mfrow=c(2,5))
+par(mar=c(6.5,5,3,2))
+stripchart(lcpm.org.epi[epi[1],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=epi[1],cex.main=2.5)
+legend("left",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),bg="n",bty="n",cex=1.5)
+for(i in 2:5){
+stripchart(lcpm.org.epi[epi[i],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=epi[i],cex.main=2.5)
+}
+
+stripchart(lcpm.org.epi[stroma[1],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[1],cex.main=2.5)
+legend("bottomright",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),bg="n",bty="n",cex=1.5)
+for(i in 2:5){
+stripchart(lcpm.org.epi[stroma[i],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[i],cex.main=2.5)
+}
+dev.off()
+```
+
+
+```{r}
+newtargets <- data.frame(Sample=colnames(lcpm.org.epi)[51:56],geno=rep(c("SC6","C32"),each=3),age=25,vial=rep(c(12,13),each=3),Batch=rep(c(7,8),each=3),geno2=rep(c("RG_0019.0149.C6","CRL1502-C32"),each=3))
+targets.all3 <- rbind(targets.all2,newtargets)
+targets.all3$type <- rep(c("organoid","EPCAM","LTL"),c(50,3,3))
+
+newid <- paste(targets.all3$geno,"Day",targets.all3$age,"Batch",targets.all3$Batch,sep="")
+newid <-factor(newid,levels=c("C32Day0Batch2","SC6Day0Batch6",
+                            "C32Day4Batch2",
+                            "C32Day7Batch2","C32Day7Batch4","C32Day7Batch5",
+                            "SC6Day7Batch6",
+                            "C32Day10Batch2",
+                            "C32Day18Batch1","C32Day18Batch2","C32Day18Batch3","C32Day18Batch4","C32Day18Batch5",
+                            "SC6Day18Batch6",
+                            "C32Day25Batch2","C32Day25Batch8",
+                            "SC6Day25Batch7"))
+
+pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/Figure6/epithelial-stroma-genes-hg19-updated.pdf",height = 10,width=23)
+par(mfrow=c(2,5))
+par(mar=c(8.5,5,3,2))
+stripchart(lcpm.org.epi[epi[1],]~newid,vertical=TRUE,
+           pch=c(16,2,16,16,16,16,2,16,16,16,16,16,16,2,16,1,6),method="jitter",
+           col=rep(ggplotColors(6),c(2,1,4,1,6,3)),las=2,cex=2,
+           group.names=c("Day0","Day0","Day4","Day7B2","Day7B4","Day7B5","Day7B6",
+                         "Day10",
+                         "Day18B1","Day18B2","Day18B3","Day18B4","Day18B5","Day18B6",
+                         "Day25","Day25","Day25"),
+           ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=epi[1],cex.main=2.5)
+legend("left",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),bg="n",bty="n",cex=1.5)                            
+
+for(i in 2:5){
+  stripchart(lcpm.org.epi[epi[i],]~newid,vertical=TRUE,
+           pch=c(16,2,16,16,16,16,2,16,16,16,16,16,16,2,16,1,6),method="jitter",
+           col=rep(ggplotColors(6),c(2,1,4,1,6,3)),las=2,cex=2,
+           group.names=c("Day0","Day0","Day4","Day7B2","Day7B4","Day7B5","Day7B6",
+                         "Day10",
+                         "Day18B1","Day18B2","Day18B3","Day18B4","Day18B5","Day18B6",
+                         "Day25","Day25","Day25"),
+           ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=epi[i],cex.main=2.5)
+}
+
+stripchart(lcpm.org.epi[stroma[1],]~newid,vertical=TRUE,
+           pch=c(16,2,16,16,16,16,2,16,16,16,16,16,16,2,16,1,6),method="jitter",
+           col=rep(ggplotColors(6),c(2,1,4,1,6,3)),las=2,cex=2,
+           group.names=c("Day0","Day0","Day4","Day7B2","Day7B4","Day7B5","Day7B6",
+                         "Day10",
+                         "Day18B1","Day18B2","Day18B3","Day18B4","Day18B5","Day18B6",
+                         "Day25","Day25","Day25"),
+           ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[1],cex.main=2.5)
+legend("bottom",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),bg="n",bty="n",cex=1.5)                            
+
+for(i in 2:5){
+  stripchart(lcpm.org.epi[stroma[i],]~newid,vertical=TRUE,
+           pch=c(16,2,16,16,16,16,2,16,16,16,16,16,16,2,16,1,6),method="jitter",
+           col=rep(ggplotColors(6),c(2,1,4,1,6,3)),las=2,cex=2,
+           group.names=c("Day0","Day0","Day4","Day7B2","Day7B4","Day7B5","Day7B6",
+                         "Day10",
+                         "Day18B1","Day18B2","Day18B3","Day18B4","Day18B5","Day18B6",
+                         "Day25","Day25","Day25"),
+           ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[i],cex.main=2.5)
+}
+dev.off()
+```
+
+
+
+
+
+
+

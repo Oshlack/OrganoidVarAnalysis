@@ -1,0 +1,1011 @@
+---
+title: "Time Series Analysis of C32 organoids"
+author: "Belinda Phipson"
+date: "27 August 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The original time series data has already been published and includes D7, D10, D18 and D25. Later on samples were sequenced from earlier time points, when cells are still in monolayer culture: D0 and D4. 
+
+The aim of this analysis is to look at differences between consecutive time points: D4 vs D0, D7 vs D4, D10 vs D7, D18 vs D10 and D25 vs D18. At each time point there are 3 replicates.
+
+I mapped the fastq files using the STAR aligner in the two pass mapping mode, using the hg19 version of the human genome, and Gencode V19 comprehensive annotation. The featureCounts software was used for summarising reads across genes.
+
+For consistent results, I have initally put all the RNA-seq data together (variability + time series) and performed filtering and normalisation and then extracted the time series data from the counts matrix for further analysis.
+
+# Quality control
+Once the counts table was generated, the data was analysed in R using the edgeR and RUVSeq packages. Annotation was obtained from the org.Hs.eg.db annotation package. Genes that had at least 1 count per million in at least 3 samples were kept for further analysis.
+
+## Load libraries
+
+```{r}
+# Remove this line Belinda
+setwd("D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/StatisticalAnalysis")
+```
+
+```{r}
+library(edgeR)
+library(limma)
+library(org.Hs.eg.db)
+library(lme4)
+library(RColorBrewer)
+library(NMF)
+library(RUVSeq)
+library(Mfuzz)
+library(scatterplot3d)
+source("./Functions/ggplotColors.R")
+source("./Functions/normCounts.R")
+options(digits=3)
+```
+
+## Read in all data and sample information
+
+```{r}
+# Additional samples (later batches), SC6 and C32 organoids
+run1 <- read.delim("./Data/counts-run1.txt",skip=1,header=TRUE,stringsAsFactors=FALSE)
+run2 <- read.delim("./Data/counts-run2.txt",skip=1,header=TRUE,stringsAsFactors=FALSE)
+
+count1 <- run1[,-(1:6)]
+count2 <- run2[,-(1:6)]
+rownames(count1) <- rownames(count2) <- run1$Geneid
+
+colnames(count1) <- gsub("_L00Aligned\\.sortedByCoord\\.out\\.bam","",colnames(count1))
+colnames(count2) <- gsub("_L00Aligned\\.sortedByCoord\\.out\\.bam","",colnames(count2))
+targets.new <- read.table("./Data/targets.txt",stringsAsFactors = FALSE,header=TRUE)
+
+# Combine the two runs together by summing the counts
+counts <- count1+count2
+saminfo <- targets.new[targets.new$Run=="run1",]
+
+# Read in time series data
+ts <- read.delim("./Data/countsD0-D18.txt",header=TRUE,skip=1,stringsAsFactors=FALSE)
+early <- read.delim("./Data/countsEarlyTimes.txt",header=TRUE,skip=1,stringsAsFactors=FALSE)
+targets.ts <- read.table("./Data/targetsALL.txt",header=TRUE,stringsAsFactors=FALSE)
+
+# Read in aditional day 18 data for variability analysis
+litt3 <- read.delim("./Data/countsLitt3.txt",skip=1,header=TRUE,stringsAsFactors = FALSE)
+litt6 <- read.delim("./Data/countsLitt6.txt",skip=1,header=TRUE,stringsAsFactors = FALSE)
+targets.var <- read.table("./Data/targets-var.txt",header=TRUE,stringsAsFactors=FALSE)
+var_data <- cbind(litt6[,-(1:6)],litt3[,-(1:6)])
+m <- match(targets.var$FileName,colnames(var_data))
+data <- var_data[,m[!is.na(m)]]
+targets.var <- targets.var[!is.na(m),]
+targets.var$Time <- 18
+
+# Combine all counts matrices together
+y <- DGEList(cbind(ts[,-(1:6)],early[,-(1:6)],data,counts))
+geno.old <- rep("C32",ncol(y)-ncol(counts))
+geno <- c(geno.old,saminfo$Geno)
+time <- c(targets.ts$Time,targets.var$Time)
+age <- c(time,saminfo$Age)
+var.vial <- targets.var$Exp
+var.vial[var.vial==1] <- 6
+new.vial <- saminfo$Vial+6
+vial <- c(targets.ts$Batch,var.vial,new.vial)
+
+```
+
+## Initial filtering
+
+```{r}
+keep <- rowSums(cpm(y)>=1)>=2
+y.keep <- y[keep,]
+y.keep$samples$lib.size <- colSums(y.keep$counts)
+```
+
+# Figure 5a:
+
+Note that sample 42 was removed as it was a failed sequencing library.
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4.5,4.5,2,2))
+plotMDS(y.keep[,-42],pch=c(16,2)[factor(geno[-42])],col=ggplotColors(6)[factor(age[-42])],cex=2.5,cex.lab=1.5,cex.axis=1.5)
+legend("topleft",legend=paste("Day ",levels(factor(age))),pch=16,col=ggplotColors(6),cex=1.5)
+legend("top",legend=c("CRL1502-C32","RG_0019.0149.C6"),pch=c(16,2),cex=1.5)
+```
+
+
+# Separate C32 and SC6 data
+
+We will analyse C32 and SC6 organoids separately. The final dataset had D18 organoids collected at 5 different points in time (batch). At one of these batches, organoids were grown in three separate vials and two organoids from each differentiation were sequenced in order to determine vial-to-vial variability.
+
+```{r}
+# Separate c32 and sc6 data
+targets.all <- data.frame(Sample=colnames(y),geno=geno,age=age,vial=vial,stringsAsFactors = FALSE)
+targets.c32 <- targets.all[geno=="C32",]
+targets.sc6 <- targets.all[geno=="SC6",]
+y.c32 <- y.keep[,geno=="C32"]
+y.c32$samples$lib.size <- colSums(y.c32$counts)
+y.sc6 <- y.keep[,geno=="SC6"]
+y.sc6$samples$lib.size <- colSums(y.sc6$counts)
+```
+
+# Sample and gene filtering
+
+We removed one sample that had failed and filtered out lowly expressed genes.
+
+```{r}
+# Remove dodgy sample
+bad.sample.id <- which(colnames(y.c32)=="PE1613_C32_Day_18_2_S18")
+y.c32.keep <- y.c32[,-bad.sample.id]
+targets.c32 <- targets.c32[-bad.sample.id,]
+table(targets.c32$Sample==colnames(y.c32.keep))
+```
+
+```{r}
+# gene filtering
+nc <- cpm(y.c32.keep)
+keep <- rowSums(nc >= 1) >= 2
+y.c32.keep <- y.c32.keep[keep,]
+```
+
+## Add gene annotation
+
+```{r}
+# Getting some annotation
+symbol <- toTable(org.Hs.egSYMBOL)
+alias <- alias2SymbolTable(rownames(y.c32.keep),species="Hs")
+m <- match(alias,symbol$symbol)
+ann <- data.frame(Original_symbol=rownames(y.c32.keep),symbol[m,])
+alias2 <- toTable(org.Hs.egALIAS2EG)
+m <- match(ann$gene_id,alias2$gene_id)
+ann$alias <- alias2$alias_symbol[m]
+gene_name <- toTable(org.Hs.egGENENAME)
+m <- match(ann$gene_id,gene_name$gene_id)
+ann$gene_name <- gene_name$gene_name[m]
+chr <- toTable(org.Hs.egCHR)
+m <- match(ann$gene_id,chr$gene_id)
+ann$chr <- chr$chromosome[m]
+rownames(ann) <- ann$Original_symbol
+ann$length <- run1$Length[match(rownames(y.c32.keep),run1$Geneid)]
+
+y.c32.keep$genes <- ann
+```
+
+## Remove ribosomal and mitochondrial genes
+```{r}
+ribo <- grep("ribosomal",y.c32.keep$genes$gene_name)
+mito <- grep("mitochondrial",y.c32.keep$genes$gene_name)
+pseudo <- grep("pseudogene",y.c32.keep$genes$gene_name)
+junk <- unique(c(ribo,mito,pseudo))
+
+y.c32.keep <- y.c32.keep[-junk,]
+
+# Get rid of genes without Entrez gene id/gene annotation
+y.c32.keep <- y.c32.keep[!is.na(y.c32.keep$genes$gene_id),]
+y.c32.keep$samples$lib.size <- colSums(y.c32.keep$counts)
+
+```
+
+# Normalisation
+
+We performed TMM normalisation.
+
+```{r}
+# TMM normalisation
+y.c32.keep$samples$lib.size <- colSums(y.c32.keep$counts)
+y.c32.keep <- calcNormFactors(y.c32.keep)
+```
+
+
+# Estimate dispersion
+
+We estimate dispersion based on the "age" covariate for the purpose of performing some QC checks.
+
+```{r}
+des.c32 <- model.matrix(~factor(targets.c32$age))
+y.c32.keep <- estimateDisp(y.c32.keep,design=des.c32,robust=TRUE)
+```
+
+# QC checks
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(4.5,4.5,2,2))
+mds.c32 <- plotMDS(y.c32.keep,labels=targets.c32$age,col=ggplotColors(8)[factor(targets.c32$vial)],ndim=3,cex=2,cex.lab=1.5,cex.axis=1.5)
+legend("topright",legend=paste("Vial",levels(factor(targets.c32$vial))),pch=16,col=ggplotColors(8),cex=1.2)
+title("C32 organoid data")
+
+big <- (y.c32.keep$tagwise.dispersion)^0.5 > 1
+plot(y.c32.keep$AveLogCPM[!big],(y.c32.keep$tagwise.dispersion[!big])^0.5,pch=16,cex=0.5,ylim=c(0,max((y.c32.keep$tagwise.dispersion)^0.5)))
+text(y.c32.keep$AveLogCPM[big],(y.c32.keep$tagwise.dispersion[big])^0.5,labels=rownames(y.c32.keep)[big],col=2,cex=0.8)
+```
+
+# Some figures for the paper
+
+```{r}
+# Figure 2B
+targets.c32$Exp <- targets.c32$vial
+targets.c32$Batch <- targets.c32$vial
+targets.c32$Batch[targets.c32$vial==6] <- 1
+targets.c32$Batch[targets.c32$vial==1] <- 2
+targets.c32$Batch[targets.c32$vial==10] <- 4
+targets.c32$Batch[targets.c32$vial==11] <- 5
+targets.c32$Batch[targets.c32$vial==3 | targets.c32$vial==4 | targets.c32$vial==5] <- 3
+targets.c32$Batch[targets.c32$age!=18] <- 0
+
+y.fig4d <- y.c32.keep[,!(targets.c32$age==7 & (targets.c32$vial==10 | targets.c32$vial==11))]
+targets.fig4d <- targets.c32[!(targets.c32$age==7 & (targets.c32$vial==10 | targets.c32$vial==11)),]
+
+# Colour by batch and age by pch
+par(mfrow=c(1,1))
+newcol <- c(1,ggplotColors(4)[1],1,ggplotColors(4)[2:4])
+plotMDS(y.fig4d,pch=c(1,2,3,4,16,6)[factor(targets.fig4d$age)],col=newcol[factor(targets.fig4d$Batch)],cex=2.5,cex.axis=1.2,cex.lab=1.5)
+legend("topleft",legend=paste("Day",levels(factor(targets.fig4d$age))),cex=1.2,pch=c(1,2,3,4,16,6))
+legend("top",legend=paste("Batch",1:5),col=newcol[-1],cex=1.3,pch=16)
+
+# Correlation heatmap 
+log.fig4 <- cpm(y.fig4d,log=TRUE)
+mypal <- brewer.pal(9,"YlOrRd")
+morecols <- colorRampPalette(mypal)
+cors.fig4 <- cor(log.fig4,method="spearman")
+
+mean(cors.fig4[upper.tri(cors.fig4)])
+
+age.lab <- paste("Day",targets.fig4d$age,sep="")
+sample.id <- paste(age.lab,"Batch",targets.fig4d$Batch,sep="")
+sample.id <- factor(sample.id,levels=c("Day0Batch0","Day4Batch0","Day7Batch0","Day10Batch0","Day18Batch3","Day18Batch1","Day18Batch4","Day18Batch5","Day18Batch2","Day25Batch0"))
+o <- order(sample.id)
+sample.id[o]
+aheatmap(cors.fig4[o,o],labRow = age.lab[o],labCol = age.lab[o],annCol =list(Batch=factor(targets.fig4d$Batch[o])),Colv = NA,Rowv = NA)
+
+# Supplementary Figure 4
+# Without batch 0 (which is actually batch 2)
+targets.fig4d$Batch2 <- targets.fig4d$Batch
+targets.fig4d$Batch2[targets.fig4d$Batch==0]<-2
+ aheatmap(cors.fig4[o,o],labRow = age.lab[o],labCol = age.lab[o],annCol =list(Batch=factor(targets.fig4d$Batch2[o])),Colv = NA,Rowv = NA)
+```
+
+```{r}
+# Scatterplot for Figure 2c
+par(mar=c(5,5,3,2))
+par(mfrow=c(2,2))
+plot(log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"],
+     log.fig4[,"Day_11_Pellet_RNA_2_S8_L00Aligned.sortedByCoord.out.bam"],
+     ylab="LogCPM: Day 18 Batch 2 Replicate 2",
+     xlab="LogCPM: Day 18 Batch 2 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation within experiment")
+abline(a=0,b=1,col=2,lwd=2)
+text(-1,13,labels = paste("Spearman correlation = ", round(cor(log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"], log.fig4[,"Day_11_Pellet_RNA_2_S8_L00Aligned.sortedByCoord.out.bam"],method="spearman"),digits=3)),cex=1.2)
+ 
+plot(log.fig4[,"d11_1.2_S1_L00Aligned.sortedByCoord.out.bam"],
+     log.fig4[,"d11_2.1_S3_L00Aligned.sortedByCoord.out.bam"],
+     ylab="LogCPM: Day 18 Batch 3 Vial 2 Replicate 1",
+     xlab="LogCPM: Day 18 Batch 3 Vial 1 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation within batch, between vials")
+abline(a=0,b=1,col=2,lwd=2)
+text(-1,13,labels = paste("Spearman correlation = ", round(cor(log.fig4[,"d11_1.2_S1_L00Aligned.sortedByCoord.out.bam"], log.fig4[,"d11_2.1_S3_L00Aligned.sortedByCoord.out.bam"],method="spearman"),digits=3)),cex=1.2)   
+
+plot(log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"],
+     log.fig4[,"X11_days_Pellet_1_S1_L00Aligned.sortedByCoord.out.bam"],
+     ylab="LogCPM: Day 18 Batch 1 Replicate 1",
+     xlab="LogCPM: Day 18 Batch 2 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation between batches")
+abline(a=0,b=1,col=2,lwd=2)
+text(-1,13,labels = paste("Spearman correlation = ", round(cor(log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"], log.fig4[,"X11_days_Pellet_1_S1_L00Aligned.sortedByCoord.out.bam"],method="spearman"),digits=3)),cex=1.2)   
+
+plot(log.fig4[,"d11_1.2_S1_L00Aligned.sortedByCoord.out.bam"],
+     log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"],
+     ylab="LogCPM: Day 18 Batch 3 Replicate 1",
+     xlab="LogCPM: Day 18 Batch 2 Replicate 1",
+     cex.lab=1.2,cex.axis=1.2,cex.main=1.5,main="Correlation between batch 2 and 3")
+abline(a=0,b=1,col=2,lwd=2)
+text(-1,13,labels = paste("Spearman correlation = ", round(cor(log.fig4[,"d11_1.2_S1_L00Aligned.sortedByCoord.out.bam"], log.fig4[,"Day_11_Pellet_RNA_1_S7_L00Aligned.sortedByCoord.out.bam"],method="spearman"),digits=3)),cex=1.2)   
+
+```
+
+# Time series analysis
+
+```{r}
+y.ts <- y.c32.keep[,targets.c32$vial==1 | targets.c32$vial==2]
+y.ts <- calcNormFactors(y.ts)
+logcpm.ts <- cpm(y.ts,log=TRUE)
+```
+
+## Figure 1b
+```{r}
+# This is my preferred figure 1b
+par(mfrow=c(1,1))
+par(mar=c(4.5,4.5,2.5,2))
+mds.ts <- plotMDS(y.ts,pch=16, col=ggplotColors(6)[factor(targets.ts$Time)],cex.lab=1.5,cex.axis=1.2,cex=2,ndim=3)
+legend("topleft",legend=paste("Day",levels(factor(targets.ts$Time))),pch=16,cex=1.4,col=ggplotColors(6))
+
+
+par(mfrow=c(1,1))
+
+scatterplot3d(x=mds.ts$cmdscale[,1],y=mds.ts$cmdscale[,2],z=mds.ts$cmdscale[,3],
+              pch=16,
+              color=ggplotColors(6)[factor(targets.ts$Time)],
+              cex.symbols = 1.75, cex.lab = 1.5, cex.axis=1.2,
+              type="h",
+              xlab="Leading logFC dim 1",ylab="Leading logFC dim 2",zlab="Leading logFC dim 3",
+              mar=c(4,4,2,4))
+legend("topleft",legend=paste("Day",levels(factor(targets.ts$Time))),pch=16,cex=1.5,bty="n",col=ggplotColors(6))
+```
+
+## Figure 1c Correlation heatmap
+
+```{r}
+cors.ts <- cor(logcpm.ts[,c(13:18,4:6,1:3,7:12)],method="spearman")
+days <- paste("Day",rep(c(0,4,7,10,18,25),each=3))
+par(mfrow=c(1,1))
+aheatmap(cors.ts,labRow = days,labCol= days,Colv = NA,Rowv=NA,fontsize = 20,main="")
+```
+
+# Linear modelling between consecutive time points
+
+We decided to analyse the data to work out the differentially expressed genes between each consecutive time point. The data were generated in two batches; the early time point samples, Days 0 and 4, were retrospectively added to the dataset. In order to account for the potential confounding of batch and age, we used RUV to account for batch effects.
+
+## Using RUV to account for the two different batches
+```{r}
+# Find genes not varying with time
+des2 <- model.matrix(~as.factor(targets.ts$Time))
+y2 <- estimateDisp(y.ts,des2,robust=TRUE)
+fit2 <- glmFit(y2,des2)
+lrt2 <- glmLRT(fit2,coef=2:6)
+R <- rank(lrt2$table$PValue)
+emp.ctrl <- R > (nrow(lrt2)-5000) 
+
+# Get RUV factors
+ruv <- RUVg(y2$counts,cIdx=emp.ctrl,k=1)
+
+# Add the RUV factor to the design matrix
+des.ruv <- model.matrix(~0+as.factor(targets.ts$Time)+ruv$W)
+colnames(des.ruv) <- c("Day0","Day4","Day7","Day10","Day18","Day25","RUV")
+y.ruv <- estimateDisp(y2,des.ruv,robust=TRUE)
+y.ruv$common.disp
+y2$common.disp
+
+```
+
+By using RUV, we see a `r (y2$common.disp-y.ruv$common.disp)/y2$common.disp*100` reduction in the common dispersion estimate.
+
+Next we use edgeR to obtain differentially expressed genes.
+
+```{r}
+# Fit glm models
+fit.ruv <- glmFit(y.ruv,des.ruv)
+my.contr <- makeContrasts(Day4-Day0,Day7-Day4,Day10-Day7,Day18-Day10,Day25-Day18,Day25-Day10,levels=des.ruv)
+
+lrt.4v0 <- glmLRT(fit.ruv,contrast=my.contr[,1])
+results.4v0 <- decideTestsDGE(lrt.4v0)
+summary(results.4v0)
+
+lrt.7v4 <- glmLRT(fit.ruv,contrast=my.contr[,2])
+results.7v4 <- decideTestsDGE(lrt.7v4)
+summary(results.7v4)
+
+lrt.10v7 <- glmLRT(fit.ruv,contrast=my.contr[,3])
+results.10v7 <- decideTestsDGE(lrt.10v7)
+summary(results.10v7)
+
+lrt.18v10 <- glmLRT(fit.ruv,contrast=my.contr[,4])
+results.18v10 <- decideTestsDGE(lrt.18v10)
+summary(results.18v10)
+
+lrt.25v18 <- glmLRT(fit.ruv,contrast=my.contr[,5])
+results.25v18 <- decideTestsDGE(lrt.25v18)
+summary(results.25v18)
+
+lrt.25v10 <- glmLRT(fit.ruv,contrast=my.contr[,6])
+results.25v10 <- decideTestsDGE(lrt.25v10)
+summary(results.25v10)
+```
+
+## Using TREAT after RUV to reduce numbers of significant genes
+
+From the analysis above we can see that there are many thousands of genes differentially expressed between the consecutive time points. We can apply a logFC threshold on top of a false discovery rate cut-off in order to reduce the numbers of signficant genes and also bring the most biologically relevant genes to the top of the lists.
+
+```{r}
+treat.4v0 <- glmTreat(fit.ruv,contrast=my.contr[,1],lfc=1)
+treatres.4v0 <- decideTestsDGE(treat.4v0)
+summary(treatres.4v0)
+
+treat.7v4 <- glmTreat(fit.ruv,contrast=my.contr[,2],lfc=1)
+treatres.7v4 <- decideTestsDGE(treat.7v4)
+summary(treatres.7v4)
+
+treat.10v7 <- glmTreat(fit.ruv,contrast=my.contr[,3],lfc=1)
+treatres.10v7 <- decideTestsDGE(treat.10v7)
+summary(treatres.10v7)
+
+treat.18v10 <- glmTreat(fit.ruv,contrast=my.contr[,4],lfc=1)
+treatres.18v10 <- decideTestsDGE(treat.18v10)
+summary(treatres.18v10)
+
+treat.25v18 <- glmTreat(fit.ruv,contrast=my.contr[,5],lfc=1)
+treatres.25v18 <- decideTestsDGE(treat.25v18)
+summary(treatres.25v18)
+
+treat.25v10 <- glmTreat(fit.ruv,contrast=my.contr[,6],lfc=1)
+treatres.25v10 <- decideTestsDGE(treat.25v10)
+summary(treatres.25v10)
+
+```
+
+### Figure 1d
+
+```{r}
+# DE results
+de.res <- matrix(NA,ncol=5,nrow=2)
+colnames(de.res) <- c("Day4v0","Day7v4","Day10v7","Day18v10","Day25v18")
+rownames(de.res) <- c("Down","Up")
+
+de.res[,1] <- summary(treatres.4v0)[c(1,3)]
+de.res[,2] <- summary(treatres.7v4)[c(1,3)]
+de.res[,3] <- summary(treatres.10v7)[c(1,3)]
+de.res[,4] <- summary(treatres.18v10)[c(1,3)]
+de.res[,5] <- summary(treatres.25v18)[c(1,3)]
+
+par(mfrow=c(1,1))
+par(mar=c(3,5,2,2))
+barplot(de.res,col=ggplotColors(2)[c(2,1)],legend=TRUE,ylab="Numbers of DE genes",cex.axis=1.2,cex.lab=1.5,cex.names=1.2)
+```
+
+### Day 4 and Day 0
+
+Here the cells transition from undifferentiated pluripotent stem cells to posterior primitive streak. The cells at Day 0 are mostly epithelium.
+
+```{r}
+top.4v0 <- topTags(treat.4v0,n="Inf")$table
+# Most significant down-regulated genes
+top.4v0[top.4v0$logFC<0,][1:20,]
+# most significant up-regulated genes
+top.4v0[top.4v0$logFC>0,][1:20,]
+```
+
+### Day 7 and Day 4
+This is when we want the cells to progress from posterior primitive streak to intermediate mesoderm.
+
+Expect to see Pax2/Pax8, Lhx1 and Osr1
+
+```{r}
+top.7v4 <- topTags(treat.7v4,n="Inf")$table
+# Most significant down-regulated genes
+top.7v4[top.7v4$logFC<0,][1:20,]
+# most significant up-regulated genes
+top.7v4[top.7v4$logFC>0,][1:20,]
+```
+
+### Day 10 and Day 7
+
+```{r}
+top.10v7 <- topTags(treat.10v7,n="Inf")$table
+# Most significant down-regulated genes
+top.10v7[top.10v7$logFC<0,][1:20,]
+# most significant up-regulated genes
+top.10v7[top.10v7$logFC>0,][1:20,]
+```
+
+### Day 18 and Day 10
+
+Between these two time points we expect a loss in pluripotency and an increase in nephron markers.
+
+```{r}
+top.18v10 <- topTags(treat.18v10,n="Inf")$table
+# Most significant down-regulated genes
+top.18v10[top.18v10$logFC<0,][1:20,]
+# most significant up-regulated genes
+top.18v10[top.18v10$logFC>0,][1:20,]
+```
+
+### Day 25 and Day 18
+
+Here we see an increase in matrillin genes as the organoids get a bit more "gooey".
+```{r}
+top.25v18 <- topTags(treat.25v18,n="Inf")$table
+# Most significant down-regulated genes
+top.25v18[top.25v18$logFC<0,][1:20,]
+# most significant up-regulated genes
+top.25v18[top.25v18$logFC>0,][1:20,]
+```
+
+## Gene set testing
+
+We performed GO analysis on the top 100 most up and down-regulated genes between each consecutive time point using the TREAT results and the goana function in limma.
+
+### Day 4 and Day 0
+```{r}
+# most significant dn-regulated genes
+t100dn <- top.4v0$gene_id[top.4v0$logFC<0][1:100]
+go.4v0.dn <- goana(de=t100dn,universe=treat.4v0$genes$gene_id, species="Hs",covariate=treat.4v0$genes$length)
+kegg.4v0.dn <- kegga(de=t100dn,universe=treat.4v0$genes$gene_id, species="Hs",covariate=treat.4v0$genes$length)
+
+
+# most significant up-regulated genes
+t100up <- top.4v0$gene_id[top.4v0$logFC>0][1:100]
+go.4v0.up <- goana(de=t100up,universe=treat.4v0$genes$gene_id, species="Hs",covariate=treat.4v0$genes$length)
+kegg.4v0.up <- kegga(de=t100up,universe=treat.4v0$genes$gene_id, species="Hs",covariate=treat.4v0$genes$length)
+
+```
+
+### Day 7 and Day 4
+
+```{r}
+# most significant dn-regulated genes
+t100dn <- top.7v4$gene_id[top.7v4$logFC<0][1:100]
+go.7v4.dn <- goana(de=t100dn,universe=treat.7v4$genes$gene_id, species="Hs",covariate=treat.7v4$genes$length)
+kegg.7v4.dn <- kegga(de=t100dn,universe=treat.7v4$genes$gene_id, species="Hs",covariate=treat.7v4$genes$length)
+
+
+# most significant up-regulated genes
+t100up <- top.7v4$gene_id[top.7v4$logFC>0][1:100]
+go.7v4.up <- goana(de=t100up,universe=treat.7v4$genes$gene_id, species="Hs",covariate=treat.7v4$genes$length)
+kegg.7v4.up <- kegga(de=t100up,universe=treat.7v4$genes$gene_id, species="Hs",covariate=treat.7v4$genes$length)
+```
+
+### Day 10 and Day 7
+
+```{r}
+# most significant up-regulated genes
+t100dn <- top.10v7$gene_id[top.10v7$logFC<0][1:100]
+go.10v7.dn <- goana(de=t100dn,universe=treat.10v7$genes$gene_id, species="Hs",covariate=treat.10v7$genes$length)
+kegg.10v7.dn <- kegga(de=t100dn,universe=treat.10v7$genes$gene_id, species="Hs",covariate=treat.10v7$genes$length)
+
+# most significant up-regulated genes
+t100up <- top.10v7$gene_id[top.10v7$logFC>0][1:100]
+go.10v7.up <- goana(de=t100up,universe=treat.10v7$genes$gene_id, species="Hs",covariate=treat.10v7$genes$length)
+kegg.10v7.up <- kegga(de=t100up,universe=treat.10v7$genes$gene_id, species="Hs",covariate=treat.10v7$genes$length)
+```
+
+### Day 18 and Day 10
+
+
+```{r}
+# most significant up-regulated genes
+t100dn <- top.18v10$gene_id[top.18v10$logFC<0][1:100]
+go.18v10.dn <- goana(de=t100dn,universe=treat.18v10$genes$gene_id, species="Hs",covariate=treat.18v10$genes$length)
+kegg.18v10.dn <- kegga(de=t100dn,universe=treat.18v10$genes$gene_id, species="Hs",covariate=treat.18v10$genes$length)
+
+# most significant up-regulated genes
+t100up <- top.18v10$gene_id[top.18v10$logFC>0][1:100]
+go.18v10.up <- goana(de=t100up,universe=treat.18v10$genes$gene_id, species="Hs",covariate=treat.18v10$genes$length)
+kegg.18v10.up <- kegga(de=t100up,universe=treat.18v10$genes$gene_id, species="Hs",covariate=treat.18v10$genes$length)
+```
+
+### Day 25 and Day 18
+
+```{r}
+# most significant dn-regulated genes
+t100dn <- top.25v18$gene_id[top.25v18$logFC<0][1:100]
+go.25v18.dn <- goana(de=t100dn,universe=treat.25v18$genes$gene_id, species="Hs",covariate=treat.25v18$genes$length)
+kegg.25v18.dn <- kegga(de=t100dn,universe=treat.25v18$genes$gene_id, species="Hs",covariate=treat.25v18$genes$length)
+
+# most significant up-regulated genes
+t100up <- top.25v18$gene_id[top.18v10$logFC>0][1:100]
+go.25v18.up <- goana(de=t100up,universe=treat.25v18$genes$gene_id, species="Hs",covariate=treat.25v18$genes$length)
+kegg.25v18.up <- kegga(de=t100up,universe=treat.25v18$genes$gene_id, species="Hs",covariate=treat.25v18$genes$length)
+```
+
+## Figures
+
+### Supplementary Figure 1: Heatmap of selected genes
+
+```{r}
+nf <- layout(matrix(c(1,1,2,1,1,3,4,5,6),3,3,byrow=TRUE))
+layout.show(nf)
+
+sel.genes <- unique(c("EPCAM","CDH1","CAV1","NANOG","SOX2","KLF4","HOXB-AS3","HOXA-AS3","MIXL1",
+               "T","CDX2","CDX1",
+               "LEF1","NOTUM","SP5","PAX8","LHX1","MEOX1","MEOX2","EYA1","SIX1","SIX2","WT1",
+               "FGF19","FGF17","MYH6","SFRP1","SFRP2","CDH5","CDH1","CD34","FOS","FOSB","ANXA1",
+               "EGR1","BMP3","NPHS1","NPHS2","PTPRO","MAFB","SYNPO","LIN28A","SALL4",
+               "MATN4","MATN1","COL9A1","COL8A2","COL9A3"))
+lognc <- normCounts(y.ruv,log=TRUE,prior.count = 1)
+m <- match(sel.genes,rownames(lognc))
+
+jpeg(filename="SuppFig1.jpeg",width=1000,height=1100)
+layout(matrix(c(1,1,2,1,1,3,4,5,6),3,3,byrow=TRUE))
+aheatmap(lognc[m,c(13:18,4:6,1:3,7:12)],Colv = NA,Rowv=NA,labCol = days,fontsize = 18, main="(a)")
+
+par(mar=c(5,15,1,1))
+o <- order(go.4v0.up$P.DE)
+o.go.4v0.up <- go.4v0.up[o,]
+scores <- -log10(o.go.4v0.up$P.DE[1:10])
+names(scores) <- o.go.4v0.up$Term[1:10]
+scores[1]<-30
+
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(6)[2],cex.names = 1.35,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="(b) Day 4 vs day 0",cex.main=2)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+par(mar=c(5,11,1,1))
+o <- order(go.7v4.up$P.DE)
+o.go.7v4.up <- go.7v4.up[o,]
+scores <- -log10(o.go.7v4.up$P.DE[1:10])
+names(scores) <- o.go.7v4.up$Term[1:10]
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(6)[3],cex.names = 1.35,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="(c) Day 7 vs day 4",cex.main=2)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+par(mar=c(5,23,1,2))
+o <- order(go.10v7.up$P.DE)
+o.go.10v7.up <- go.10v7.up[o,]
+scores <- -log10(o.go.10v7.up$P.DE[1:10])
+names(scores) <- o.go.10v7.up$Term[1:10]
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(6)[4],cex.names = 1.35,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="(d) Day 10 vs day 7",cex.main=2)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+par(mar=c(5,14,1,2))
+o <- order(go.18v10.up$P.DE)
+o.go.18v10.up <- go.18v10.up[o,]
+scores <- -log10(o.go.18v10.up$P.DE[1:10])
+names(scores) <- o.go.18v10.up$Term[1:10]
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(6)[5],cex.names = 1.35,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="(e) Day 18 vs day 10",cex.main=2)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+
+par(mar=c(5,20,1,2))
+o <- order(go.25v18.up$P.DE)
+o.go.25v18.up <- go.25v18.up[o,]
+scores <- -log10(o.go.25v18.up$P.DE[1:10])
+names(scores) <- o.go.25v18.up$Term[1:10]
+barplot(scores[10:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(6)[6],cex.names = 1.35,xlab="-log10(P-value)",cex=1.2,cex.lab=1.5,main="(f) Day 25 vs day 18",cex.main=2)
+abline(v=-log10(0.05),lty=2,col=colours()[275])
+dev.off()
+```
+
+# Cluster analysis with Mfuzz
+
+First, I performed an voom + limma analysis to identify genes that change at any point across the time course, taking into account the RUV factors I calculated previously. I used an F statistic to rank these genes, which were then used as input into a fuzzy clustering algorithm. I used the top 10,000 genes based on F statistic as input to Mfuzz. I then imposed the condition that the genes should have abs(logFC) greater than one (two fold difference) between at least one comparison. This reduced the genes to 7682.
+
+```{r}
+v <- voom(y.ruv,des.ruv,plot=TRUE)
+fit <- lmFit(v,des.ruv)
+contrasts <- makeContrasts(d0 = Day0 - (Day4+Day7+Day10+Day18+Day25)/5,
+d4 = Day4 - (Day0+Day7+Day10+Day18+Day25)/5,
+d7 = Day7 - (Day0+Day4+Day10+Day18+Day25)/5,
+d10 = Day10 - (Day0+Day4+Day7+Day18+Day25)/5,
+d18 = Day18 - (Day0+Day4+Day7+Day10+Day25)/5,
+d25 = Day25 - (Day0+Day4+Day7+Day10+Day18)/5,
+levels=des.ruv)
+
+fit.contr <- contrasts.fit(fit,contrasts=contrasts)
+fit.contr <- eBayes(fit.contr,robust=TRUE)
+top <- topTable(fit.contr,sort.by="F",n="Inf")
+maxLFC <- apply(abs(top[,8:13]),1,max)
+sigGenes <- rownames(top)[1:10000][maxLFC[1:10000]>1]
+length(sigGenes)
+```
+
+Mfuzz was originally designed for microarray data, so I transformed the counts to log counts per million (with a small prior count of 0.25 added), and averaged each of the three replicates per time point. The input into Mfuzz was a matrix with `r length(sigGenes)` genes, and a column for each time point (6). According to the Mfuzz user's guide, the data should be "standardised" such that each gene has a mean of zero and standard deviation of one. This ensures that vectors of genes with similar changes in expression are close in Euclidean space.
+
+```{r}
+lcpm.fuzz <- cpm(y.ruv,log=TRUE)
+m <- match(sigGenes,rownames(lcpm.fuzz))
+forFuzz <- lcpm.fuzz[m,c(13:18,4:6,1:3,7:12)]
+time <- rep(c(0,4,7,10,18,25),each=3)
+avgData <- matrix(NA,ncol=6,nrow=nrow(forFuzz))
+rownames(avgData) <- rownames(forFuzz)
+colnames(avgData) <- c("Day0","Day4","Day7","Day10","Day18","Day25")
+for(i in 1:nrow(avgData)) avgData[i,] <- tapply(forFuzz[i,],time,mean)
+```
+
+```{r}
+set.seed(25)
+eset <- new("ExpressionSet",exprs=avgData)
+data.s <- standardise(eset)
+m1 <- mestimate(data.s)
+m1
+cl <- mfuzz(data.s,c=20,m=m1)
+```
+
+## Supplementary Figure 2: clusters
+```{r}
+jpeg(filename="SuppFig2.jpeg",width=480,height=800)
+mfuzz.plot(data.s,cl=cl,mfrow=c(5,4),time.labels=c(0,4,7,10,18,25))
+dev.off()
+```
+
+Core genes in each cluster were extracted using a membership score of 0.5.
+
+```{r}
+acore.list <- acore(data.s,cl=cl,min.acore=0.5)
+max.length <- max(unlist(lapply(acore.list,function(x) max(dim(x)))))
+coreGenes <- matrix(NA,ncol=20,nrow=max.length)
+colnames(coreGenes) <- paste("Cluster",1:20)
+for(i in 1:20){
+  genes <- as.character(acore.list[[i]]$NAME)
+  o <- order(acore.list[[i]]$MEM.SHIP,decreasing=TRUE)
+  coreGenes[1:length(genes),i] <- genes[o]
+}
+```
+
+## Supplementary Figure 3a
+```{r}
+par(mfrow=c(3,3))
+par(mar=c(4.5,4.5,2,2))
+
+# CLuster 5
+m <- match(acore.list[[5]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,])-0.35, max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 5",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+# Add special genes
+points(c(0,4,7,10,18,25),exprs(data.s)[match("SIX1",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("SIX1",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("MEOX1",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("MEOX1",rownames(exprs(data.s))),],col=2,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("EYA1",rownames(exprs(data.s))),],col="purple",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("EYA1",rownames(exprs(data.s))),],col="purple",lwd=2)
+
+legend("bottom",legend=c("Core genes","SIX1*","MEOX1","EYA1"),lty=1,lwd=2,col=c("grey",4,2,"purple"),cex=1)
+
+
+# CLuster 17
+m <- match(acore.list[[17]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 17",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("WT1",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("WT1",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("LHX1",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("LHX1",rownames(exprs(data.s))),],col=2,lwd=2)
+legend("bottomright",legend=c("Core genes","WT1*","LHX1*"),lty=1,lwd=2,col=c("grey",4,2),cex=1)
+
+
+# Cluster 6
+m <- match(acore.list[[6]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 6",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("MEIS1",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("MEIS1",rownames(exprs(data.s))),],col=4,lwd=2)
+legend("bottomright",legend=c("Core genes","MEIS1*"),lty=1,lwd=2,col=c("grey",4),cex=1)
+
+# CLuster 7
+m <- match(acore.list[[7]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 7",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("EPCAM",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("EPCAM",rownames(exprs(data.s))),],col=4,lwd=2)
+
+legend("bottomright",legend=c("Core genes","EPCAM*"),lty=1,lwd=2,col=c("grey",4),cex=1)
+
+# CLuster 11
+#m <- match(acore.list[[11]]$NAME,rownames(exprs(data.s)))
+#plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 11",cex.main=2)
+#for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+#axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+# CLuster 10
+m <- match(acore.list[[10]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 10",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("NPHS1",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("NPHS1",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("CUBN",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("CUBN",rownames(exprs(data.s))),],col=2,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("MAFB",rownames(exprs(data.s))),],col="purple",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("MAFB",rownames(exprs(data.s))),],col="purple",lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("KIRREL",rownames(exprs(data.s))),],col="orange",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("KIRREL",rownames(exprs(data.s))),],col="orange",lwd=2)
+
+legend("bottomright",legend=c("Core genes","NPHS1*","CUBN*","MAFB*","NEPH1"),lty=1,lwd=2,col=c("grey",4,2,"purple","orange"),cex=1)
+
+# CLuster 12
+m <- match(acore.list[[12]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 12",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("NPHS2",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("NPHS2",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("SYNPO",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("SYNPO",rownames(exprs(data.s))),],col=2,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("CLIC5",rownames(exprs(data.s))),],col="purple",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("CLIC5",rownames(exprs(data.s))),],col="purple",lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("PTPRO",rownames(exprs(data.s))),],col="orange",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("PTPRO",rownames(exprs(data.s))),],col="orange",lwd=2)
+
+legend("bottomright",legend=c("Core genes","NPHS2","SYNPO","CLIC5","PTPRO"),lty=1,lwd=2,col=c("grey",4,2,"purple","orange"),cex=1)
+
+# Cluster 14
+m <- match(acore.list[[14]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 14",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("PAX2",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("PAX2",rownames(exprs(data.s))),],col=4,lwd=2)
+
+legend("bottomright",legend=c("Core genes","PAX2*"),lty=1,lwd=2,col=c("grey",4),cex=1)
+
+# Cluster 15
+m <- match(acore.list[[15]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 15",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("NANOG",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("NANOG",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("SOX2",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("SOX2",rownames(exprs(data.s))),],col=2,lwd=2)
+
+legend("topright",legend=c("Core genes","NANOG","SOX2"),lty=1,lwd=2,col=c("grey",4,2),cex=1)
+
+# Cluster 16
+m <- match(acore.list[[16]]$NAME,rownames(exprs(data.s)))
+plot(c(0,4,7,10,18,25),exprs(data.s)[m[1],],type="l",col="grey",ylim=c( min(exprs(data.s)[m,]), max(exprs(data.s)[m,])+0.25),xaxt="n",cex.axis=1.5,cex.lab=1.5,xlab="Day",ylab="Normalised log-expression",main="Cluster 16",cex.main=2)
+for(i in 2:length(m)) lines(c(0,4,7,10,18,25),exprs(data.s)[m[i],],col="grey")
+axis(side=1,at=c(0,4,7,10,18,25),labels=TRUE,cex.axis=1.5)
+
+points(c(0,4,7,10,18,25),exprs(data.s)[match("CDX1",rownames(exprs(data.s))),],col=4,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("CDX1",rownames(exprs(data.s))),],col=4,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("CDX2",rownames(exprs(data.s))),],col=2,pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("CDX2",rownames(exprs(data.s))),],col=2,lwd=2)
+points(c(0,4,7,10,18,25),exprs(data.s)[match("WNT8A",rownames(exprs(data.s))),],col="purple",pch=16,cex=1.5)
+lines(c(0,4,7,10,18,25),exprs(data.s)[match("WNT8A",rownames(exprs(data.s))),],col="purple",lwd=2)
+
+legend("topright",legend=c("Core genes","CDX1","CDX2*","WNT8A"),lty=1,lwd=2,col=c("grey",4,2,"purple"),cex=1)
+```
+
+
+## PCR validation
+```{r}
+pcr <- read.delim(file="./Data/qPCR-zscores-for-R.txt",header=TRUE,row.names=1)
+m <- match(rownames(pcr),rownames(exprs(data.s)))
+val.data <- exprs(data.s)[m[!is.na(m)],]
+pcr.nm <- pcr[!is.na(m),]
+par(mfrow=c(3,5))
+par(mar=c(4.5,4.5,2,2))
+plot(c(0,10,18,25),val.data[1,c(1,4:6)],ylim=c(-2.3,2),xaxt="n",xlab="Day",ylab="Z-score",cex.axis=1.5,cex.lab=1.5)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+lines(c(0,10,18,25),val.data[1,c(1,4:6)])
+points(c(0,10,18,25),pcr.nm[1,c(1,2,4,7)],col=2)
+lines(c(0,10,18,25),pcr.nm[1,c(1,2,4,7)],col=2,lty=2)
+title(rownames(val.data)[1])
+legend("bottomright",legend=c("RNA-Seq","PCR"),pch=1,col=c(1,2))
+for(i in 2:15){
+plot(c(0,10,18,25),val.data[i,c(1,4:6)],ylim=c(-2.3,2),xaxt="n",xlab="Day",ylab="Z-score",cex.axis=1.5,cex.lab=1.5,cex.axis=1.5,cex.lab=1.5)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+lines(c(0,10,18,25),val.data[i,c(1,4:6)])
+points(c(0,10,18,25),pcr.nm[i,c(1,2,4,7)],col=2)
+lines(c(0,10,18,25),pcr.nm[i,c(1,2,4,7)],col=2,lty=2)
+title(rownames(val.data)[i])
+}
+```
+
+## Supplementary Figure 3b
+
+```{r}
+# CLuster 5/17
+par(mfrow=c(2,3))
+par(mar=c(4.5,4.5,2,2))
+cl5 <- c("SIX1","WT1","LHX1")
+plot(c(0,10,18,25),pcr[cl5[1],c(1,2,4,7)],ylim=c(-2.3,2),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl5[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+points(c(0,10,18,25),pcr[cl5[2],c(1,2,4,7)],cex=1.5,pch=16,col=2)
+lines(c(0,10,18,25),pcr[cl5[2],c(1,2,4,7)],lwd=2,col=2)
+points(c(0,10,18,25),pcr[cl5[3],c(1,2,4,7)],cex=1.5,pch=16,col="orange")
+lines(c(0,10,18,25),pcr[cl5[3],c(1,2,4,7)],lwd=2,col="orange")
+legend("bottom",legend=cl5,lty=1,lwd=2,col=c(4,2,"orange"),cex=1.25)
+title("Cluster 5/17",cex.main=2)
+
+# CLuster 6
+cl6 <- "MEIS1"
+plot(c(0,10,18,25),pcr[cl6[1],c(1,2,4,7)],ylim=c(-2.3,1.5),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl6[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+legend("topleft",legend=cl6,lty=1,lwd=2,col=c(4),cex=1.25)
+title("Cluster 6",cex.main=2)
+
+# CLuster 7
+cl7 <- "EPCAM"
+plot(c(0,10,18,25),pcr[cl7[1],c(1,2,4,7)],ylim=c(-2.3,1.5),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl7[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+legend("top",legend=cl7,lty=1,lwd=2,col=c(4),cex=1.25)
+title("Cluster 7",cex.main=2)
+
+#Cluster 10
+cl10 <- c("NPHS1","CUBN","MAFB")
+plot(c(0,10,18,25),pcr[cl10[1],c(1,2,4,7)],ylim=c(-2,1.5),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl10[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+points(c(0,10,18,25),pcr[cl10[2],c(1,2,4,7)],cex=1.5,pch=16,col=2)
+lines(c(0,10,18,25),pcr[cl10[2],c(1,2,4,7)],lwd=2,col=2)
+points(c(0,10,18,25),pcr[cl10[3],c(1,2,4,7)],cex=1.5,pch=16,col="orange")
+lines(c(0,10,18,25),pcr[cl10[3],c(1,2,4,7)],lwd=2,col="orange")
+legend("topleft",legend=cl10,lty=1,lwd=2,col=c(4,2,"orange"),cex=1.25)
+title("Cluster 10",cex.main=2)
+
+# CLuster 14
+cl14 <- "PAX2"
+plot(c(0,10,18,25),pcr[cl14[1],c(1,2,4,7)],ylim=c(-2.3,1),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl14[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+legend("topleft",legend=cl14,lty=1,lwd=2,col=c(4),cex=1.25)
+title("Cluster 14",cex.main=2)
+
+# Cluster 16
+
+cl16 <- "CDX2"
+plot(c(0,10,18,25),pcr[cl16[1],c(1,2,4,7)],ylim=c(-1.2,2),xaxt="n",xlab="Day",ylab="qPCR Z-score",cex.axis=1.5,cex.lab=1.5,pch=16,cex=1.5,cex.axis=1.5,col=4)
+lines(c(0,10,18,25),pcr[cl16[1],c(1,2,4,7)],lwd=2,col=4)
+axis(side=1,at=c(0,10,18,25),labels=TRUE,cex.axis=1.5)
+legend("bottom",legend=cl16,lty=1,lwd=2,col=c(4),cex=1.25)
+title("Cluster 16",cex.main=2)
+```
+
+## Gene set testing of core genes in each cluster
+
+```{r}
+outID <- vector("list",20)
+m.c <- vector("list",20)
+for(i in 1:20){
+  m <- match(acore.list[[i]]$NAME,rownames(y.ruv))
+  m.c[[i]] <- match(acore.list[[i]]$NAME,rownames(y.ruv))
+  outID[[i]] <- y.ruv$genes$gene_id[m][!is.na(y.ruv$genes$gene_id[m])]
+}
+
+universe <- y.ruv$genes$gene_id
+genelength <- y.ruv$genes$length
+
+sig.go <- sig.kegg <- rep(NA,20)
+for(i in 1:20){
+ g <- goana(outID[[i]],universe=universe,covariate=genelength)
+ g$FDR <- p.adjust(g$P.DE,method="BH")
+ o <- order(g$P.DE)
+ write.csv(g[o,],file=paste("./tables/MfuzzClusters/Cluster",i,"GOtesting.csv",sep=""))
+ sig.go[i] <- sum(g$FDR < 0.05)
+ 
+ k <- kegga(outID[[i]],universe=universe,covariate=genelength)
+ k$FDR <- p.adjust(k$P.DE,method="BH")
+ o <- order(k$P.DE)
+ write.csv(k[o,],file=paste("./tables/MfuzzClusters/Cluster",i,"KEGGtesting.csv",sep=""))
+ sig.kegg[i] <- sum(k$FDR<0.05)
+}
+
+# Total number of significant GO categories in each cluster after correcting for multiple testing
+names(sig.go) <- names(sig.kegg) <- paste("Cluster",1:20)
+sig.go
+
+```
+
+# Check for Transcription Factors
+
+```{r}
+tf <- read.csv("./Data/TFhg19-fantom5.csv",stringsAsFactors = FALSE)
+
+acore.list <- acore(data.s,cl=cl,min.acore=0.5)
+tfclust <- vector("list",20)
+m.c <- vector("list",20)
+for(i in 1:20){
+  m <- match(as.character(acore.list[[i]]$NAME),tf$Symbol)
+  tfclust[[i]] <- as.character(acore.list[[i]]$NAME)[!is.na(m)]
+}
+
+max.length <- max(unlist(lapply(tfclust,length)))
+TFGenes <- matrix(NA,ncol=20,nrow=max.length)
+colnames(TFGenes) <- paste("Cluster",1:20)
+for(i in 1:20){
+  TFGenes[1:length(tfclust[[i]]),i] <- tfclust[[i]]
+}
+
+```
+
+```{r}
+jaspar <- tf[!is.na(tf$Associated.Motif),]
+
+jtfclust <- vector("list",20)
+for(i in 1:20){
+  m <- match(as.character(acore.list[[i]]$NAME),jaspar$Symbol)
+  jtfclust[[i]] <- as.character(acore.list[[i]]$NAME)[!is.na(m)]
+}
+```
+
+
