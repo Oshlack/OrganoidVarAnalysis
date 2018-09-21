@@ -13,14 +13,13 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Introduction
 
-I will assume that the time series analsis hasn't been run and will redo the data processing here before the analysis.
+I will assume that the time series analysis has not been run and will redo the data processing here, before the variability analysis.
+
+The kidney organoid differentiation experiments were repeated multiple times - there were 5 batches separated in time. All organoids were grown to day 18. Batch 3 has a total of 6 organoids grown from 3 separate vials of starting material. This allowed us to fit a random effects model to all day 18 organoids to get an estimate of the contributions of batch, vial and residual to the total variability we observe between day 18 organoids. This was done for the C32 clone.
+
+We also performed additional sequencing of the SC6 clone, with 6 organoids sequenced from day 18 that were grown concurrently from 3 different vials of starting material. This allowed us to fit a random effects model with 2 components: vial and residual.
  
 ## Load libraries
-
-```{r}
-# Remove this line Belinda
-setwd("D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/StatisticalAnalysis")
-```
 
 ```{r}
 library(edgeR)
@@ -201,6 +200,7 @@ targets.c32.d18$vial2[targets.c32.d18$vial==1] <- 2
 ```
 
 ## Correlation between organoids
+We calculated Spearman's correlation which is a rank based measure of association.
 
 ```{r}
 logcpm <- cpm(y.c32.d18,log=TRUE)
@@ -210,7 +210,8 @@ cors <- cor(logcpm,method="spearman")
 
 mean(cors[upper.tri(cors)])
 
-
+par(mfrow=c(1,1))
+par(mar=c(5,5,2,2))
 group2 <- paste("Batch",targets.c32.d18$Batch,"Exp",targets.c32.d18$vial2,sep="")
 aheatmap(cors,col=morecols(50),labRow = group2,labCol = group2,annCol =list(Batch=factor(targets.c32.d18$Batch),Exp= factor(targets.c32.d18$vial2)))
 ```
@@ -285,7 +286,13 @@ MaxVar <- apply(PropVar,1,function(x) names(which.max(x)))
 results <- data.frame(y.c32.d18$genes,AvgLogCPM=Amean,PropVar,VarComp,TotVar=TotVar,MaxVarExplained=MaxVar,stringsAsFactors = FALSE)
 o <- order(results$TotVar,decreasing=TRUE)
 results <- results[o,]
+head(results)
 ```
+
+```{r}
+write.csv(results,file="./tables/VarCompResults.csv",row.names=FALSE)
+```
+
  
 ### Figures
 
@@ -349,7 +356,7 @@ aheatmap(logts[rownames(results)[1:50],c(4:6,1:3,7:12)],
 
 ## Estimate the age of the C32 organoids
 
-Here we use the time series data as a baseline to compare against in order to predict the age of the organoids from Batches 1, 3, 4 and 5.
+Here we use the time series data as a baseline to compare against in order to predict the ages of the organoids from Batches 1, 3, 4 and 5. We fit a linear model using voom and limma to identify the top 10 genes that are most linearly associated with Days 7, 10, 18 and 25. We use these genes as explanatory variables to build a multivariate linear regression with "age" as the dependent variable. Using the regression coefficients, we then treat the Day 18 organoids as "new data" and predict the ages of the organoids from the 5 batches based on the expression levels of the 10 genes.
 
 ```{r}
 class(targets.ts$Time)
@@ -429,9 +436,8 @@ targets.c32$Batch[targets.c32$vial==1] <- 1
 
 ```{r}
 cols <- ggplotColors(6)
-par(mfrow=c(1,1))
-plotMDS(y.c32.keep,labels=targets.c32$predAge,col=ggplotColors(8)[factor(targets.c32$vial)],ndim=3,cex=1,cex.lab=1.5,cex.axis=1.5)
 par(mfrow=c(1,2))
+plotMDS(y.c32.keep,labels=targets.c32$predAge,col=ggplotColors(8)[factor(targets.c32$vial)],ndim=3,cex=1,cex.lab=1.5,cex.axis=1.5)
 par(mar=c(4.5,4.5,2,2))
 plotMDS(y.c32.keep,labels=targets.c32$age,col=cols[c(2,1,3,4,5,6)][factor(targets.c32$Batch)],cex=2,cex.lab=1.5,cex.axis=1.5)
 legend("topright",legend=paste("Batch",levels(factor(targets.c32$Batch))),fill=cols[c(2,1,3,4,5,6)],cex=1.5)
@@ -447,6 +453,8 @@ stripchart(predAge~batch,vertical=TRUE,pch=16,method="jitter",col=newcol[-1],cex
 
 # Data analysis of the SC6 data
 
+We also looked at a different cell line in order to determine how similar the kidney organoids would be if they had a different genetic background. For the SC6 data we have samples from Days 0, 7 and 18. The 6 organoids from Day 18 are grown concurrently in three different starting vials (2 organoids sampled from each vial).
+
 ```{r}
 dim(y.sc6)
 dim(targets.sc6)
@@ -456,7 +464,7 @@ targets.sc6$vial2[targets.sc6$vial==8] <- 2
 targets.sc6$vial2[targets.sc6$vial==9] <- 3
 ```
 
-
+We kept genes that had at least 1 count per million in at least 2 samples.
 ```{r}
 # gene filtering
 nc.sc6 <- cpm(y.sc6)
@@ -621,7 +629,7 @@ results.sc6 <- results.sc6[o,]
 ```
 
 ```{r}
-write.csv(results.sc6,file="VarCompResults-SC6-06092018.csv",row.names=FALSE)
+write.csv(results.sc6,file="./tables/VarCompResults-SC6.csv",row.names=FALSE)
 ```
 
 
@@ -681,12 +689,12 @@ topGO(goana(de=results.sc6$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, spec
 
 # Top 100 most variable vial-vial
 results.sc6.vial <- results.sc6[results.sc6$MaxVarExplained=="PropVial",]
-write.csv(topGO(goana(de=results.sc6.vial$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="sc6-vialgenes-GO.csv")
+write.csv(topGO(goana(de=results.sc6.vial$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="./tables/sc6-vialgenes-GO.csv")
 
 
 # top 100 most variable residual
 results.sc6.res <- results.sc6[results.sc6$MaxVarExplained=="PropRes",]
-write.csv(topGO(goana(de=results.sc6.res$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="sc6-residgenes-GO.csv")
+write.csv(topGO(goana(de=results.sc6.res$gene_id[1:100],universe=y.sc6.d18$genes$gene_id, species="Hs",covariate = length)),file="./tables/sc6-residgenes-GO.csv")
 
 ```
 
@@ -723,9 +731,10 @@ abline(v=-log10(0.05),lty=2,col=colours()[275])
 
 ```
 
-############## CHECK FROM HERE ########################
 
 # Analyse two cell lines together
+
+Here we see that when you add the data from the two cell lines together, the samples cluster by Day rather than by genetic background.
 
 ```{r}
 dim(y.keep)
@@ -747,8 +756,10 @@ targets.all2$Batch[targets.all2$vial==1] <- 2
 targets.all2$Batch[targets.all2$vial==7 | targets.all2$vial==8 | targets.all2$vial==9] <- 6
 ```
 
+Figure 5b: 
+
 ```{r}
-## Correlation heatmap (figure 4)
+## Correlation heatmap
 logcpm.all <- cpm(y.keep2,log=TRUE)
 mypal <- brewer.pal(9,"YlOrRd")
 morecols <- colorRampPalette(mypal)
@@ -777,6 +788,8 @@ aheatmap(cors.all[o,o],labRow=paste("Day",targets.all2$age)[o],labCol=paste("Day
   
 ```
 
+## Hierarchical clustering
+
 ```{r}
 # Hierarchical clustering with heatmaps
 # find most variable genes
@@ -791,6 +804,10 @@ par(mar=c(5,5,2,2))
 dd <- dist(t(logcpm.all[var.genes[1:100],]))
 plot(hclust(dd),labels=group.all)
 ```
+
+## Differential expression analysis between Day 18 SC6 and C32 organoids
+
+Here we compare the Batch 3 Day 18 C32 organoids with the SC6 Day 18 organoids as they have an identical experimental design. We then see whether these genes that are differentially expressed are the same as the genes that are differentially expressed between Day 18 versus Day 10 of the original time series data (Batch 2). This will indicate that the differences between the cell lines are involved in nephron development and hence maturity related genes, rather than being due to genetic differences between the cell lines.
 
 ```{r}
 design.all <- model.matrix(~0+grp.all)
@@ -812,21 +829,28 @@ topTreat(fit.treat,coef=1)
 topTreat(fit.treat,coef=2)
 
 vennDiagram(decideTests(fit.treat))
-plot(fit.treat$coefficients[,1],fit.treat$coefficients[,2])
-abline(h=0,v=0)
 
+plot(fit.treat$coefficients[,1],fit.treat$coefficients[,2])
+abline(h=0,v=0,col="grey")
+abline(a=0,b=1,col="blue")
+```
+
+We formally test whether the genes DE between SC6 vs C32 Day 18 are significantly changing as a set when comparing Day 18 vs Day 10 C32 organoids. We do this using a ROAST gene set test. We split the genes into an up-regulated and down-regulated set.
+
+```{r}
 up.genes <- rownames(res)[res[,1]==1]
 dn.genes <- rownames(res)[res[,1]== -1]
-
-pdf(file="Z:/Group-Little_MCRI/Manuscripts/In Progress/Phipson 2017 Organoid transcriptional profiling/Figure6/barcodeplot-sc6vsc32.pdf",height = 5,width=8)
+# Figure 5f
 barcodeplot(fit.treat$t[,2],index=match(up.genes,rownames(fit.treat)),
             index2=match(dn.genes,rownames(fit.treat)))
-dev.off()
+
 
 roast(v.all,index=match(up.genes,rownames(fit.treat)),design=design.all,contrast = contr[,2],nrot=9999)
 
 roast(v.all,index=match(dn.genes,rownames(fit.treat)),design=design.all,contrast = contr[,2],nrot=9999)
 ```
+
+Figure 5e:
 
 ```{r}
 # Heatmap with DE genes from day18 vs day 10
@@ -840,23 +864,21 @@ logcpm.d18 <- cpm(y.all.d18,log=TRUE)
 par(mfrow=c(1,1))
 par(mar=c(5,5,5,2))
 aheatmap(logcpm.d18[de.genes.ts,],labCol=targets.all.d18$geno2,annCol=list(Batch=factor(targets.all.d18$Batch),CellLine=factor(targets.all.d18$geno2)),fontsize = 14,main="All day 18 organoids",labRow=NA)
-
-o <- order(grp.all)
-aheatmap(logcpm.all[de.genes.ts,o],labCol=targets.all2$age[o],annCol=list(Batch=factor(targets.all2$Batch[o]),geno=targets.all2$geno2[o]),fontsize = 12,Colv = NA)
 ```
 
 # Add epithelial sorted organoid samples
 
 ```{r}
 # NPHP3 data
-counts.nphp3 <- read.delim("D:/_MCRI/_Analysis projects/MelissaLittle/NPHP3_disease_modelling/counts.txt",skip=1,header=TRUE)
-targets.nphp3 <- read.table("D:/_MCRI/_Analysis projects/MelissaLittle/NPHP3_disease_modelling/targets.txt",header=TRUE,stringsAsFactors=FALSE)
+counts.nphp3 <- read.delim("./Data/counts_nphp3.txt",skip=1,header=TRUE,stringsAsFactors=FALSE)
+targets.nphp3 <- read.table("./Data/targets_nphp3.txt",header=TRUE,stringsAsFactors=FALSE)
 data.nphp3 <- counts.nphp3[,16:18]
 rownames(data.nphp3) <- counts.nphp3$Geneid
 ```
 
-## Add new data
- 
+## Add EPCAM sorted fraction
+
+
 ```{r}
 y.c32.sc6.nphp3 <- DGEList(cbind(ts[,-(1:6)],early[,-(1:6)],data,counts,data.nphp3))
 keep <- rowSums(cpm(y.c32.sc6.nphp3)>=1)>=2
@@ -875,28 +897,19 @@ legend("bottomleft",legend=paste("Day",levels(factor(age.all))),col=ggplotColors
 legend("top",legend=c("CRL1502-C32","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,2,6),cex=1,bg="n",bty="n")
 ```
 
+## Add LTL sorted fraction: 
+
 ```{r}
-# Lorna's data which is mapped to hg38
-# Replace data.lorna with hg19 mapped counts
-#data.lorna <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/aligned_reads_star/counts_gencodeV20.txt",skip=1,header=TRUE)
+data.hg19 <- read.delim("./Data/counts_hg19.txt",header=TRUE)
 
-data.hg19 <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/aligned_reads_star_hg19/counts_hg19.txt",skip=1,header=TRUE)
+counts.c32.ltl <- data.hg19[,-(1:2)]
+rownames(counts.c32.ltl) <- data.hg19[,1]
 
-counts.lorna <- data.hg19[,-(1:6)]
-rownames(counts.lorna) <- data.hg19[,1]
-colnames(counts.lorna) <- gsub("_ML170410_170322_HCVCFBGX2_NB501544_L000_Aligned.sortedByCoord.out.bam","",colnames(counts.lorna))
-colnames(counts.lorna) <- gsub("_ML170411_170323_HCTFWBGX2_NB501544_L000_Aligned.sortedByCoord.out.bam","",colnames(counts.lorna))
-
-targets.lorna <- read.delim("Z:/Group-Little_MCRI/Data/RNA-Seq/RawData/Lorna-podocyte/analysis/targets.txt",stringsAsFactors = FALSE,sep="\t")
-
-counts.c32.ltl <- counts.lorna[,targets.lorna$CellType=="C32" & targets.lorna$Source=="LTL"]
 
 table(rownames(counts.c32.ltl) == rownames(y.c32.sc6.nphp3))
 
-m <- match(rownames(y.c32.sc6.nphp3),rownames(counts.c32.ltl))
-
-y.c32.sc6.nphp3.ltl <- DGEList(cbind(ts[!is.na(m),-(1:6)],early[!is.na(m),-(1:6)],data[!is.na(m),],counts[!is.na(m),],data.nphp3[!is.na(m),],counts.c32.ltl[m[!is.na(m)],]))
-rownames(y.c32.sc6.nphp3.ltl) <- rownames(counts.c32.ltl[m[!is.na(m)],])
+y.c32.sc6.nphp3.ltl <- DGEList(cbind(ts[,-(1:6)],early[,-(1:6)],data,counts,data.nphp3,counts.c32.ltl))
+rownames(y.c32.sc6.nphp3.ltl) <- rownames(counts.c32.ltl)
 
 keep <- rowSums(cpm(y.c32.sc6.nphp3.ltl)>=1)>=2
 y.c32.sc6.nphp3.ltl.keep <- y.c32.sc6.nphp3.ltl[keep,]
@@ -905,6 +918,8 @@ y.c32.sc6.nphp3.ltl.keep$samples$lib.size <- colSums(y.c32.sc6.nphp3.ltl.keep$co
 geno.all.ltl <- c(geno.all,"C32-LTL","C32-LTL","C32-LTL")  
 age.all.ltl <- c(age.all,25,25,25)
 ```
+
+Figure 5g:
 
 ```{r}
 par(mfrow=c(1,2))
@@ -919,6 +934,7 @@ legend("bottomright",legend=paste("Day",levels(factor(age.all.ltl))),col=ggplotC
 legend("topleft",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6","RG_0019.0149.C6-EPCAM"),pch=c(16,1,2,6),cex=1.15,bg="n",bty="n")
 ```
 
+Figure 5 h and i:
 
 ```{r}
 # Show expression of epithelial and interstitial genes
@@ -929,7 +945,7 @@ lcpm.org.epi <- cpm(y.c32.sc6.nphp3.ltl.keep[,-42],log=TRUE)
 samples.all <- paste(geno.all.ltl[-42],"Day",age.all.ltl[-42],sep="")
 samples.all <- factor(samples.all,levels=c("C32Day0","SC6Day0","C32Day4","C32Day7","SC6Day7","C32Day10","C32Day18","SC6Day18","C32Day25","C32-LTLDay25","SC6-EPCAMDay25"))
 
-pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/Figure6/epithelial-stroma-genes-hg19-updated.pdf",height = 10,width=22)
+
 par(mfrow=c(2,5))
 par(mar=c(6.5,5,3,2))
 stripchart(lcpm.org.epi[epi[1],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=epi[1],cex.main=2.5)
@@ -943,9 +959,10 @@ legend("bottomright",legend=c("CRL1502-C32","CRL1502-C32-LTL","RG_0019.0149.C6",
 for(i in 2:5){
 stripchart(lcpm.org.epi[stroma[i],]~samples.all,vertical=TRUE,pch=c(16,2,16,16,2,16,16,2,16,1,6),method="jitter",col=rep(ggplotColors(6),c(2,1,2,1,2,3)),las=2,cex=2,group.names=c("Day0","Day0","Day4","Day7","Day7","Day10","Day18","Day18","Day25","Day25","Day25"),ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[i],cex.main=2.5)
 }
-dev.off()
+
 ```
 
+Updated Figure 5 h and i:
 
 ```{r}
 newtargets <- data.frame(Sample=colnames(lcpm.org.epi)[51:56],geno=rep(c("SC6","C32"),each=3),age=25,vial=rep(c(12,13),each=3),Batch=rep(c(7,8),each=3),geno2=rep(c("RG_0019.0149.C6","CRL1502-C32"),each=3))
@@ -963,7 +980,6 @@ newid <-factor(newid,levels=c("C32Day0Batch2","SC6Day0Batch6",
                             "C32Day25Batch2","C32Day25Batch8",
                             "SC6Day25Batch7"))
 
-pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/Figure6/epithelial-stroma-genes-hg19-updated.pdf",height = 10,width=23)
 par(mfrow=c(2,5))
 par(mar=c(8.5,5,3,2))
 stripchart(lcpm.org.epi[epi[1],]~newid,vertical=TRUE,
@@ -1007,7 +1023,7 @@ for(i in 2:5){
                          "Day25","Day25","Day25"),
            ylab="Log-counts-per-million",cex.lab=2.5,cex.axis=2,main=stroma[i],cex.main=2.5)
 }
-dev.off()
+
 ```
 
 

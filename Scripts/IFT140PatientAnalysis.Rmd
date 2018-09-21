@@ -15,12 +15,6 @@ knitr::opts_chunk$set(echo = TRUE)
 
 
 ```{r}
-# Remove this line Belinda
-setwd("D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/StatisticalAnalysis")
-```
-
-
-```{r}
 library(edgeR)
 library(limma)
 library(org.Hs.eg.db)
@@ -32,7 +26,6 @@ library(scatterplot3d)
 source("./Functions/ggplotColors.R")
 source("./Functions/normCounts.R")
 ```
-
 
 
 ```{r}
@@ -106,7 +99,7 @@ topGO(goana(fit.treat,geneid="ENTREZID",trend="LENGTH"))
 # Add variability data
 
 ```{r}
-vardata <- read.csv("D:/_MCRI/_Analysis projects/MelissaLittle/VariabilityInterIntraExp/NewData/VarCompResults_07052017.csv",stringsAsFactors=FALSE)
+vardata <- read.csv("./tables/VarCompResults.csv",stringsAsFactors=FALSE)
 vardata$VarRank <- c(1:nrow(vardata))
 
 m <- match(top$SYMBOL,vardata$Original_symbol)

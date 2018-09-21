@@ -27,11 +27,6 @@ Once the counts table was generated, the data was analysed in R using the edgeR 
 ## Load libraries
 
 ```{r}
-# Remove this line Belinda
-setwd("D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/StatisticalAnalysis")
-```
-
-```{r}
 library(edgeR)
 library(limma)
 library(org.Hs.eg.db)
@@ -698,9 +693,7 @@ cl <- mfuzz(data.s,c=20,m=m1)
 
 ## Supplementary Figure 2: clusters
 ```{r}
-jpeg(filename="SuppFig2.jpeg",width=480,height=800)
 mfuzz.plot(data.s,cl=cl,mfrow=c(5,4),time.labels=c(0,4,7,10,18,25))
-dev.off()
 ```
 
 Core genes in each cluster were extracted using a membership score of 0.5.
@@ -960,13 +953,13 @@ for(i in 1:20){
  g <- goana(outID[[i]],universe=universe,covariate=genelength)
  g$FDR <- p.adjust(g$P.DE,method="BH")
  o <- order(g$P.DE)
- write.csv(g[o,],file=paste("./tables/MfuzzClusters/Cluster",i,"GOtesting.csv",sep=""))
+ write.csv(g[o,],file=paste("./tables/Cluster",i,"GOtesting.csv",sep=""))
  sig.go[i] <- sum(g$FDR < 0.05)
  
  k <- kegga(outID[[i]],universe=universe,covariate=genelength)
  k$FDR <- p.adjust(k$P.DE,method="BH")
  o <- order(k$P.DE)
- write.csv(k[o,],file=paste("./tables/MfuzzClusters/Cluster",i,"KEGGtesting.csv",sep=""))
+ write.csv(k[o,],file=paste("./tables/Cluster",i,"KEGGtesting.csv",sep=""))
  sig.kegg[i] <- sum(k$FDR<0.05)
 }
 
