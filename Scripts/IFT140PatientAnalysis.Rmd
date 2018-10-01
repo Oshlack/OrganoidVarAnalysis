@@ -13,6 +13,20 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Introduction
 
+This is an example of a disease modelling study using kidney organoids to gain understanding of a genetic kidney disease. A patient presented with kidney disease (nephronophthisis) and was subsequently found to have a compound-heterozygous mutation in the IFT140 gene. A one-step reprogramming and gene-editing protocol was used to derive both uncorrected proband iPSCs and isogenic gene-corrected iPSCs, which were differentiated to kidney organoids. The epithelial fraction of Day 25 patient and gene-corrected organoids were isolated and sequenced. We performed a differential expression (DE) analysis between patient (n=3) and gene-corrected (n=3) samples. We were able to use the information from our variability analysis to improve DE testing in this context.
+
+The full disease modelling study was published here:
+Thomas A. Forbes, Sara E. Howden, Kynan Lawlor, Belinda Phipson, Jovana Maksimovic, Lorna Hale, Sean Wilson, Catherine Quinlan, Gladys Ho, Katherine Holman, Bruce Bennetts, Joanna Crawford, Peter Trnka, Alicia Oshlack, Chirag Patel, Andrew Mallett, Cas Simons, Melissa H. Little,
+Patient-iPSC-Derived Kidney Organoids Show Functional Validation of a Ciliopathic Renal Phenotype and Reveal Underlying Pathogenetic Mechanisms,
+The American Journal of Human Genetics,
+Volume 102, Issue 5,
+2018,
+Pages 816-831,
+ISSN 0002-9297,
+https://doi.org/10.1016/j.ajhg.2018.03.014.
+(http://www.sciencedirect.com/science/article/pii/S0002929718301034)
+
+# Load libraries and data
 
 ```{r}
 library(edgeR)
@@ -37,6 +51,8 @@ targets <- read.csv("./Data/SampleSheet.csv",stringsAsFactors = FALSE)
 targets
 ```
 
+# Convert to DGEList object, add annotation
+
 ```{r}
 dge <- DGEList(counts=counts, genes=rownames(counts), group=targets$Group)
 colnames(dge) <- paste(targets$ID,targets$Group,sep=".")
@@ -51,6 +67,10 @@ dge$genes$LENGTH <- raw$Length[rownames(raw) %in% rownames(dge)]
 dge
 ```
 
+# Quality control plots
+
+We checked the library sizes as well as an MDS plot for quality control purposes. The samples appear to be good quality.
+
 ```{r}
 pal = ggplotColors(length(unique(targets$Group)))
 par(mfrow=c(1,2))
@@ -62,11 +82,19 @@ labels=targets$ID)
 legend("topright", legend=levels(factor(targets$Group)), text.col=pal)
 ```
 
+# Filtering and normalisation
+
+We kept genes that had at least one count per million in at least 3 samples. We then performed TMM normalisation.
+
 ```{r}
 isexpr <- rowSums(cpm(dge) > 1) >= 3
 y <- dge[isexpr,,keep.lib.sizes=FALSE]
 y <- calcNormFactors(y)
 ```
+
+# Differential expression analysis
+
+The patient and gene-corrected samples were differentiated concurrently, and repeated three times, hence we have a paired structure. We are interested in a  Patient vs Gene corrected comparison, taking into account the pairing. We perform a voom transformation, followed by a limma analysis.
 
 ```{r}
 design <- model.matrix(~0+factor(targets$Group)+factor(targets$Pair))
@@ -87,6 +115,8 @@ summary(dt)
 top <- topTable(fit2,coef=1,n="Inf")
 ```
 
+We can also perform a TREAT analysis in order to prioritise genes with larger log-fold-changes. Here we specify an absolute logFC cut-off of 1.25. This reduces the number of significant genes.
+
 ```{r}
 # TREAT analysis
 fit.treat <- treat(fit2,lfc=log2(1.25))
@@ -97,6 +127,10 @@ topGO(goana(fit.treat,geneid="ENTREZID",trend="LENGTH"))
 
 
 # Add variability data
+
+We import the results table from the variability analysis and incorporate this information into the DE results. Genes that are highly variable are ranked 1,2,...,1000, and genes that have variability rank > 1000 are assumed to be negligibly variable. We excluded the top 1000 most variable genes from our DE tables and focussed on pathway analysis to get a better understanding of the underlying biology. 
+
+From the boxplots you can see that the DE genes include highly variable genes.
 
 ```{r}
 vardata <- read.csv("./tables/VarCompResults.csv",stringsAsFactors=FALSE)
@@ -116,23 +150,33 @@ boxplot(top$VarRank[1:100],top$VarRank[1:200],top$VarRank[1:300],top$VarRank[1:4
 
 # Gene set test of variability genes
 
+If we treat the top 1000 most variable genes as a gene set, we can formally test whether the DE genes are enriched for variability genes. From the ROAST test and the barcodeplot we can see that the variability genes are enriched in the down-regulated genes.
+
 ```{r}
 topvar <- vardata$Original_symbol[1:1000]
 mset <- match(topvar, fit$genes$SYMBOL)
 mset <- mset[!is.na(mset)]
 length(mset)
 
+#Figure 6b:
+
+par(mfrow=c(1,1))
 barcodeplot(fit2$t[,1],mset)
 title("Top 1000 most variable genes")
+
+#Gene set test
 roast(v,index=mset,design=design,contrast=c.matrix[,1])
 ```
 
 ```{r}
+#Heatmap of highly variable genes
+par(mfrow=c(1,1))
 lcpm <- normCounts(y,log=TRUE,prior.count = 1)
 aheatmap(lcpm[mset,],annCol=list(Patient=targets$Group,Diff=targets$Pair),fontsize=12)
 ```
 
 ```{r}
+#MDSplot using the highly variable genes
 par(mar=c(4.5,4.5,2,2))
 par(mfrow=c(1,2))
 plotMDS(y[mset,], top=length(mset),col=pal[factor(targets$Group)],pch=c(16,17,8)[factor(targets$Pair)],cex=3,cex.lab=1.5,cex.axis=1.5)
@@ -142,50 +186,32 @@ plotMDS(y[mset,], top=length(mset),col=pal[factor(targets$Group)],pch=c(16,17,8)
 ```
 
 
-# GO and KEGG analysis of all genes
+# GO and KEGG analysis 
+
+Here we explore the enriched pathways looking at genes that are significantly down-regulated with an FDR < 0.01. We compare GO analysis when we look at all significant genes, as well as the significant genes with the variable genes removed.
 
 ```{r}
 topsig <- top[top$adj.P.Val<0.01,]
-topGO(goana(de=topsig$ENTREZID,universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig$ENTREZID,universe=top$ENTREZID,length=top$LENGTH))
-
-topGO(goana(de=topsig$ENTREZID[topsig$logFC>0.7],universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig$ENTREZID[topsig$logFC>0.7],universe=top$ENTREZID,length=top$LENGTH))
-
-topGO(goana(de=topsig$ENTREZID[topsig$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig$ENTREZID[topsig$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH))
-
 go.b.dn <- goana(de=topsig$ENTREZID[topsig$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH)
+topGO(go.b.dn)
 ```
 
 
 ```{r}
 topvarsig <- top[top$VarRank<1000 & top$adj.P.Val<0.01,]
-topGO(goana(de=topvarsig$ENTREZID,universe=top$ENTREZID,length=top$LENGTH))
-topGO(goana(de=topvarsig$ENTREZID[topvarsig$logFC>0.7],universe=top$ENTREZID,length=top$LENGTH))
-topGO(goana(de=topvarsig$ENTREZID[topvarsig$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH))
-
 go.var <- goana(de=topvarsig$ENTREZID,universe=top$ENTREZID,length=top$LENGTH)
+topGO(go.var)
 ```
 
 ```{r}
 topsig2 <- top[top$VarRank>1000 & top$adj.P.Val<0.01,]
-topGO(goana(de=topsig2$ENTREZID,universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig2$ENTREZID,universe=top$ENTREZID,length=top$LENGTH))
-
-topGO(goana(de=topsig2$ENTREZID[topsig2$logFC>0.7],universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig2$ENTREZID[topsig2$logFC>0.7],universe=top$ENTREZID,length=top$LENGTH))
-
-topGO(goana(de=topsig2$ENTREZID[topsig2$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH))
-topKEGG(kegga(de=topsig2$ENTREZID[topsig2$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH))
-
 go.a.dn <- goana(de=topsig2$ENTREZID[topsig2$logFC< -0.7],universe=top$ENTREZID,length=top$LENGTH)
+topGO(go.a.dn)
 ```
 
 
 # Figure for paper
 ```{r}
-pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/FigureIFT140/GOfigure2.pdf",height = 5,width=17)
 par(mfrow=c(1,3))
 par(mar=c(4.5,21,1,1))
 o <- order(go.var$P.DE)
@@ -209,8 +235,6 @@ barplot(scoresb[20:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(3)[factor(on
 abline(v=-log10(0.05),lty=2,col=colours()[275])
 legend("bottomright",legend=levels(factor(ontb)),fill=ggplotColors(3),cex=1.5)
 
-
-
 o <- order(go.a.dn$P.DE)
 o.go.a.dn <- go.a.dn[o,]
 scoresa <- -log10(o.go.a.dn$P.DE[1:20])
@@ -222,13 +246,12 @@ barplot(scoresa[20:1],beside=TRUE,horiz=TRUE,las=2,col=ggplotColors(3)[factor(on
 abline(v=-log10(0.05),lty=2,col=colours()[275])
 legend("bottomright",legend=levels(factor(onta)),fill=ggplotColors(3),cex=1.5)
 
-dev.off()
 ```
 
+Figure 6d,e,f
 ```{r}
-# Colours
-pdf(file="D:/_MCRI/_Analysis projects/MelissaLittle/NatureMethods/FigureIFT140/GOfigure2.pdf",height = 5,width=17)
-par(mfrow=c(1,3))
+#Colours
+par(mfrow=c(1,1))
 par(mar=c(4.5,25,1,1))
 var.col <- rep(ggplotColors(5)[2],20)
 var.col[names(scores) %in% names(scoresb)]<-ggplotColors(5)[1]
@@ -253,7 +276,7 @@ after.col[names(scoresa) %in% names(scores)]<-ggplotColors(5)[1]
 par(mar=c(4.5,19,1,1))
 barplot(scoresa[20:1],beside=TRUE,horiz=TRUE,las=2,col=after.col[20:1],cex.names = 1.5,xlab="-log10(P-value)",cex=1.5,cex.lab=1.5,main="Down-reg excluding var genes",cex.main=1.8)
 abline(v=-log10(0.05),lty=2,col=colours()[275])
-dev.off()
+
 ```
 
 ```{r}
@@ -262,6 +285,7 @@ plot(0,type='n',axes=FALSE,ann=FALSE)
 legend("top",legend=c("Var GO overlap","Unique GO: var genes","Common GO: DE with & without var genes","Unique GO: DE with var genes","Unique GO: DE excluding var genes"),bty="n",fill=ggplotColors(5),horiz = F,cex=1.5)
 ```
 
+Figure 6c:
 
 ```{r}
 par(mar=c(2,2,3,2))
@@ -281,55 +305,13 @@ title("Significant GO terms",cex.main=2)
 ```
 
 
+# MDSplot with time series data
 
-# GO terms before and after removing variable genes
-
-```{r}
-go <- goana(fit2,geneid="ENTREZID",trend="LENGTH")
-topGO(go)
-
-topvar <- vardata$Original_symbol[1:1000]
-mset <- match(topvar, fit2$genes$SYMBOL)
-mset <- mset[!is.na(mset)]
-length(mset)
-go.1000r <- goana(fit2[-mset,],geneid="ENTREZID",trend="LENGTH")
-topGO(go.1000r)
-
-kegg.1000r <- kegga(fit2[-mset,],geneid="ENTREZID",trend="LENGTH")
-topKEGG(kegg.1000r)
-```
-
+Figure 6a:
 
 ```{r}
-# Before removing variable genes
-t100up <- top$ENTREZID[top$logFC>0][1:479]
-go.up <- goana(de=t100up,universe=fit2$genes$ENTREZID, species="Hs",covariate=fit2$genes$length)
-topGO(go.up)
-
-t100dn <- top$ENTREZID[top$logFC<0][1:642]
-go.dn <- goana(de=t100dn,universe=fit2$genes$ENTREZID, species="Hs",covariate=fit2$genes$length)
-topGO(go.dn)
-```
-
-```{r}
-# After removing variable genes
-top1000r <- top[top$VarRank>1000,]
-
-t100upr <- top1000r$ENTREZID[top1000r$logFC>0][1:425]
-go.1000.up <- goana(de=t100upr,universe=fit2$genes$ENTREZID, species="Hs",covariate=fit2$genes$length)
-topGO(go.1000.up)
-
-t100dnr <- top1000r$ENTREZID[top1000r$logFC<0][1:472]
-go.1000.dn <- goana(de=t100dnr,universe=fit2$genes$ENTREZID, species="Hs",covariate=fit2$genes$length)
-topGO(go.1000.dn)
-```
-
-
-# New MDSplot with TS data
-
-```{r}
-load("D:/_MCRI/_Analysis projects/MelissaLittle/VariabilityInterIntraExp/NewData/Robjects/C32-all-TS.rdata")
-load("D:/_MCRI/_Analysis projects/MelissaLittle/VariabilityInterIntraExp/NewData/analysis/ift140data.Rdata")
+load("./Data/C32-all-TS.rdata")
+load("./Data/ift140data.Rdata")
 m <- match(rownames(y),rownames(y.ts))
 y.keep <- y[!is.na(m),]
 y.ts.keep <- y.ts[m[!is.na(m)],]
@@ -352,7 +334,6 @@ md$x <- -1*md$x
 plotMDS(md,pch=my.pch,col=mycol,cex=2.25,cex.lab=1.5,cex.axis=1.5)
 legend("top",legend=paste("Day",levels(factor(time))),pch=c(1,2,3,4,8,6),cex=1.35)
 legend("bottomleft",legend=levels(factor(geno)),fill=c(1,ggplotColors(2)),cex=1.2)
-
 
 ```
 
