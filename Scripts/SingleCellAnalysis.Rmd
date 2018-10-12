@@ -1,0 +1,972 @@
+---
+title: "Single cell analysis of 4 organoids"
+author: "Belinda Phipson"
+date: "10/1/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction
+
+Here we analyse single cells from 4 kidney organoids generated in 2 batches to see if we can see evidence of batch effects and specifically relate this to organoid maturity. We decided to focus on differences in proportions of cells per cell type, and/or differences in gene expression.
+
+# Load libraries
+
+```{r}
+library(cellrangerRkit)
+library(edgeR)
+library(RColorBrewer)
+library(org.Hs.eg.db)
+library(limma)
+library(Seurat)
+library(monocle)
+library(NMF)
+```
+
+```{r}
+source("/group/bioi1/belinda/SingleCell/Normalisation/normCounts.R")
+```
+
+```{r}
+ggplotColors <- function(g){
+
+  d <- 360/g
+
+  h <- cumsum(c(15, rep(d,g - 1)))
+
+  hcl(h = h, c = 100, l = 65)
+
+}
+```
+
+# Read in data
+
+The first 3 organoids were run in one batch, and the fourth organoid was run in a separate batch. The data has been processed using cellranger and read into R using cellrangerRkit. 
+
+For those reproducing the analysis, please replace the path to the data with the appropriate location. We kept batch 1 and batch 2 organoids separate and performed quality control on each of the batches of organoids separately.
+
+```{r}
+# Read in Batch 1 organoid data (3 replicates)
+# 7004 cells
+genome <- "GRCh38"
+pathout <- "path-to-batch1-data"
+gbm <- load_cellranger_matrix(pathout, genome=genome)
+
+use_genes <- get_nonzero_genes(gbm)
+
+counts.b1 <- exprs(gbm[use_genes,])
+genes.b1 <- fData(gbm[use_genes,])
+
+mycounts.b1 <- as.matrix(counts.b1)
+summary(colSums(mycounts.b1))
+dim(mycounts.b1)
+```
+
+```{r}
+# Read in batch 2 organoid data "H1" (1 replicate)
+# 1421 cells
+pathout.h1 <- "path-to-batch2-data"
+gbm.b2 <- load_cellranger_matrix(pathout.h1, genome=genome)
+
+use_genes <- get_nonzero_genes(gbm.b2)
+
+counts.b2 <- exprs(gbm.b2[use_genes,])
+genes.b2 <- fData(gbm.b2[use_genes,])
+
+mycounts.b2 <- as.matrix(counts.b2)
+summary(colSums(mycounts.b2))
+dim(mycounts.b2)
+```
+
+# Filter cells in batch 1 organoid data
+
+I decided to filter out cells based on the proportion of zeroes per cell. I also checked the library size, and cells with high proportions of ribosomal and mitochondrial expression. I checked the diversity of the cells to make sure cells with only a couple of very highly expressed genes are identified and filtered out.
+
+
+```{r}
+pz.b1 <- colMeans(mycounts.b1==0)
+libsize.b1 <- colSums(mycounts.b1)
+```
+
+```{r,fig.width=5,fig.height=5}
+plot(libsize.b1,pz.b1,xlab="Sequencing depth",ylab="Proportion zeroes per cell")
+abline(h=0.95,col=2)
+```
+
+
+```{r}
+keep.cells <- pz.b1 < 0.95
+counts.b1.keep <- mycounts.b1[,keep.cells]
+dim(counts.b1.keep)
+```
+
+This leaves `r ncol(counts.b1.keep)` cells for further analysis.
+
+## Add gene annotation
+Gene annotation based on the org.Hs.eg package was added, additional filtering based on mitochondrial and ribosomal expression performed.
+
+```{r}
+y <- DGEList(counts.b1.keep)
+# add annotation
+ens <- toTable(org.Hs.egENSEMBL2EG)
+symbol <- toTable(org.Hs.egSYMBOL)
+m <- match(rownames(y),ens$ensembl_id)
+
+ann <- data.frame(OriginalEns= rownames(y),Ensembl=ens$ensembl_id[m],EntrezID=ens$gene_id[m],stringsAsFactors = FALSE)
+rownames(ann) <- rownames(y)
+
+m <- match(ann$EntrezID,symbol$gene_id)
+ann$Symbol <- symbol$symbol[m]
+
+genename <- toTable(org.Hs.egGENENAME)
+m <- match(ann$EntrezID,genename$gene_id)
+ann$Genename <- genename$gene_name[m]
+
+chr <- toTable(org.Hs.egCHR)
+m <- match(ann$EntrezID,chr$gene_id)
+ann$Chr <- chr$chromosome[m]
+
+y$genes <- ann
+y.b1 <- y
+```
+
+## Check cells with high prop ribosomal and mitochodrial expression
+
+```{r}
+# Check mito and ribo genes
+mito <- grep("mitochondrial",y.b1$genes$Genename)
+ribo <- grep("ribosomal",y.b1$genes$Genename)
+propmito <- colSums(y.b1$counts[mito,])/colSums(y.b1$counts)
+propribo <- colSums(y.b1$counts[ribo,])/colSums(y.b1$counts)
+```
+
+```{r,fig.width=5,fig.height=5}
+plot(colSums(y.b1$counts),propribo,xlab="Library size",ylab="Proportion ribosomal counts")
+plot(colSums(y.b1$counts),propmito,xlab="Library size",ylab="Proportion mitochondrial counts")
+
+par(mfrow=c(1,2))
+plot(density(propribo),main="Density of proportion of ribosomal reads")
+plot(density(propmito),lwd=2,main="Density of proportion of mitochondrial reads")
+```
+
+The mitochondrial reads actually take up very little of the sequencing real estate (<5%) so I don't feel the need to filter based on mitochondrial expression. In general, there is a fairly large proportion of reads assigned to ribosomal genes, however there don't seem to be any obvious outliers, so I don't filter out any additional cells based on these metrics.
+
+## Check diversity of each cell
+
+The diversity of the cells look fine.
+
+```{r}
+sorted <- y.b1$counts
+for(i in 1:ncol(sorted)) sorted[,i] <- sort(sorted[,i],decreasing=TRUE)
+prop <- t(t(sorted)/colSums(sorted))
+cumprop <- apply(prop,2,cumsum)
+
+pz <- colMeans(y.b1$counts==0)
+mypal <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypal)
+cols <- rev(morecols(length(pz)))
+o <- order(pz)
+mycol=cols[order(o)]
+
+par(mfrow=c(1,1))
+plot(1:500,cumprop[1:500,1],col=mycol[1],type="l",lwd=2,ylim=c(0,1),ylab="Cumulative proportion of library",xlab="Number of features")
+for(i in 2:ncol(cumprop)) lines(1:500,cumprop[1:500,i],col=mycol[i],lwd=2)
+legend("bottomright",fill=c(mypal[1],mypal[6],mypal[length(mypal)]),legend=c("High PropZ","Mid PropZ","Low PropZ"))
+
+```
+
+# Filter genes in batch 1 organoid data
+
+First I will throw out mitochondrial and ribosomal genes, as well as genes without any annotation, which won't help with interpretation of clusters.
+
+```{r}
+chuck <- unique(c(mito,ribo))
+y.b1 <- y.b1[-chuck,]
+
+#Remove genes with no entrez gene id
+no.id <- is.na(y.b1$genes$EntrezID)
+y.b1 <- y.b1[!no.id,]
+dim(y.b1)
+
+y.b1$samples$lib.size <- colSums(y.b1$counts)
+```
+
+Following that, I've chosen to filter out genes that have zeroes in more than `r ncol(y.b1)-20` cells (ie I think a cluster size of 20 is reasonable).
+
+```{r}
+numzero.genes <- rowSums(y.b1$counts==0)
+avg.exp <- rowMeans(cpm(y.b1,log=TRUE))
+
+plot(avg.exp,numzero.genes,xlab="Average log-normalised-counts",ylab="Number zeroes per gene")
+
+table(numzero.genes > (ncol(y.b1)-20))
+
+```
+
+```{r}
+keep.genes <- numzero.genes < (ncol(y.b1)-20)
+y.b1.keep <- y.b1[keep.genes,]
+y.b1.keep$samples$lib.size <- colSums(y.b1.keep$counts)
+dim(y.b1.keep)
+```
+
+There are `r nrow(y.b1.keep)` genes left for further analysis.
+
+# Check MDSplot after filtering (batch 1)
+
+```{r,fig.width=5,fig.height=5}
+pz <- colMeans(y.b1.keep$counts==0)
+mypal <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypal)
+cols <- rev(morecols(length(pz)))
+o <- order(pz)
+mycol=cols[order(o)]
+mds.b1 <- plotMDS(y.b1.keep,gene.selection = "common",pch=16,col=mycol)
+title("Coloured by dropout per cell")
+```
+
+
+# Filter cells from batch 2 organoid
+
+I filtered batch 2 organoid cells based on the proportions of zeroes per cell. There were only 2 cells that looked a bit different on the propZero vs Library size plot compared to the rest of the cells. I checked library size, proportions of ribosomal and mitochodrial gene expression and the diversity of the cells (as for batch 1 organoids).
+
+```{r}
+pz.b2 <- colMeans(mycounts.b2==0)
+libsize.b2 <- colSums(mycounts.b2)
+```
+```{r,fig.width=5,fig.height=5}
+plot(libsize.b2,pz.b2,xlab="Sequencing depth",ylab="Proportion zeroes per cell")
+abline(h=0.92,col=2)
+```
+
+
+```{r}
+keep.cells <- pz.b2 < 0.92
+counts.b2.keep <- mycounts.b2[,keep.cells]
+```
+
+This leaves `r ncol(counts.b2.keep)` cells for further analysis.
+
+## Add gene annotation
+
+```{r}
+y <- DGEList(counts.b2.keep)
+# add annotation
+ens <- toTable(org.Hs.egENSEMBL2EG)
+symbol <- toTable(org.Hs.egSYMBOL)
+m <- match(rownames(y),ens$ensembl_id)
+
+ann <- data.frame(OriginalEns= rownames(y),Ensembl=ens$ensembl_id[m],EntrezID=ens$gene_id[m],stringsAsFactors = FALSE)
+rownames(ann) <- rownames(y)
+
+m <- match(ann$EntrezID,symbol$gene_id)
+ann$Symbol <- symbol$symbol[m]
+
+genename <- toTable(org.Hs.egGENENAME)
+m <- match(ann$EntrezID,genename$gene_id)
+ann$Genename <- genename$gene_name[m]
+
+chr <- toTable(org.Hs.egCHR)
+m <- match(ann$EntrezID,chr$gene_id)
+ann$Chr <- chr$chromosome[m]
+
+y$genes <- ann
+y.b2 <- y
+```
+
+## Check cells with high prop ribosomal and mitochodrial expression
+
+```{r}
+# remove ribosomal and mitochondrial genes
+mito <- grep("mitochondrial",y.b2$genes$Genename)
+ribo <- grep("ribosomal",y.b2$genes$Genename)
+propmito <- colSums(y.b2$counts[mito,])/colSums(y.b2$counts)
+propribo <- colSums(y.b2$counts[ribo,])/colSums(y.b2$counts)
+```
+
+```{r,fig.width=5,fig.height=5}
+plot(colSums(y.b2$counts),propribo,xlab="Library size",ylab="Proportion ribosomal counts")
+plot(colSums(y.b2$counts),propmito,xlab="Library size",ylab="Proportion mitochondrial counts")
+
+plot(density(propribo),main="Density of proportion of ribosomal reads")
+plot(density(propmito),lwd=2,main="Density of proportion of mitochondrial reads")
+```
+
+## Check diversity of each cell
+
+The diversity of the cells look fine.
+
+```{r}
+sorted <- y.b2$counts
+for(i in 1:ncol(sorted)) sorted[,i] <- sort(sorted[,i],decreasing=TRUE)
+prop <- t(t(sorted)/colSums(sorted))
+cumprop <- apply(prop,2,cumsum)
+
+pz <- colMeans(y.b2$counts==0)
+mypal <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypal)
+cols <- rev(morecols(length(pz)))
+o <- order(pz)
+mycol=cols[order(o)]
+
+par(mfrow=c(1,1))
+plot(1:500,cumprop[1:500,1],col=mycol[1],type="l",lwd=2,ylim=c(0,1),ylab="Cumulative proportion of library",xlab="Number of features")
+for(i in 2:ncol(cumprop)) lines(1:500,cumprop[1:500,i],col=mycol[i],lwd=2)
+legend("bottomright",fill=c(mypal[1],mypal[6],mypal[length(mypal)]),legend=c("High PropZ","Mid PropZ","Low PropZ"))
+
+```
+
+# Filter genes from batch 2 organoid
+
+First I will throw out mitochondrial and ribosomal genes, as well as genes without any annotation, which won't help with interpretation of clusters.
+
+```{r}
+chuck <- unique(c(mito,ribo))
+y.b2 <- y.b2[-chuck,]
+
+#Remove genes with no entrez gene id
+no.id <- is.na(y.b2$genes$EntrezID)
+y.b2 <- y.b2[!no.id,]
+dim(y.b2)
+
+y.b2$samples$lib.size <- colSums(y.b2$counts)
+```
+
+Following that, I've chosen to filter out genes that have zeroes in more than `r ncol(y.b2)-20` cells (ie I think a cluster size of 20 is reasonable).
+
+```{r}
+numzero.genes <- rowSums(y.b2$counts==0)
+avg.exp <- rowMeans(cpm(y.b2,log=TRUE))
+
+plot(avg.exp,numzero.genes,xlab="Average log-normalised-counts",ylab="Number zeroes per gene")
+
+table(numzero.genes > (ncol(y.b2)-20))
+
+```
+
+```{r}
+keep.genes <- numzero.genes < (ncol(y.b2)-20)
+y.b2.keep <- y.b2[keep.genes,]
+y.b2.keep$samples$lib.size <- colSums(y.b2.keep$counts)
+dim(y.b2.keep)
+```
+
+There are `r nrow(y.b2.keep)` genes left for further analysis.
+
+# Check MDSplot after filtering (batch 2 organoid)
+
+```{r,fig.width=5,fig.height=5}
+pz <- colMeans(y.b2.keep$counts==0)
+mypal <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypal)
+cols <- rev(morecols(length(pz)))
+o <- order(pz)
+mycol=cols[order(o)]
+mds.b2 <- plotMDS(y.b2.keep,gene.selection = "common",pch=16,col=mycol)
+title("Coloured by dropout per cell")
+```
+
+# Create Seurat objects
+
+Now that I have filtered out cells and genes from batch 1 and batch 2 organoid data, I am happy to proceed with clustering the data to determine cell types. I followed the tutorial on the Satija lab website for combining datasets (https://satijalab.org/seurat/immune_alignment.html).
+
+```{r}
+orgid <- factor(substr(colnames(y.b1.keep),18,18))
+table(orgid)
+
+batch1 <- CreateSeuratObject(raw.data = y.b1.keep$counts)
+batch1 <- AddMetaData(object = batch1, metadata = orgid, col.name = "biorep")
+
+batch1 <- NormalizeData(object = batch1, normalization.method = "LogNormalize", scale.factor = 10000)
+
+batch1 <- ScaleData(object = batch1)
+
+batch1 <- FindVariableGenes(object = batch1, do.plot=FALSE,mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+```
+
+```{r}
+orgid2 <- factor(rep(4,ncol(y.b2.keep$counts)))
+colnames(y.b2.keep)<-gsub("-1","",colnames(y.b2.keep))
+
+batch2 <- CreateSeuratObject(raw.data = y.b2.keep$counts)
+batch2 <- AddMetaData(object = batch2, metadata = orgid2, col.name = "biorep")
+
+batch2 <- NormalizeData(object = batch2, normalization.method = "LogNormalize", scale.factor = 10000)
+
+batch2 <- ScaleData(object = batch2)
+
+batch2 <- FindVariableGenes(object = batch2, do.plot=FALSE,mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+```
+
+# Select highly variable genes
+```{r}
+hvg.b1 <- rownames(x = head(x = batch1@hvg.info, n = 2000))
+hvg.b2 <- rownames(x = head(x = batch2@hvg.info, n = 2000))
+hvg.union <- union(x = hvg.b1, y = hvg.b2)
+```
+
+# Combine datasets
+```{r}
+batch1@meta.data[, "protocol"] <- "batch1"
+batch2@meta.data[, "protocol"] <- "batch2"
+```
+
+# Run CCA and merge objects
+```{r}
+comb <- RunCCA(object = batch1, object2 = batch2,genes.use = hvg.union)
+```
+
+# Visualise the CCA components
+
+```{r}
+p1 <- DimPlot(object = comb, reduction.use = "cca", group.by = "protocol", pt.size = 0.5, 
+    do.return = TRUE)
+p2 <- VlnPlot(object = comb, features.plot = "CC1", group.by = "protocol", do.return = TRUE)
+plot_grid(p1,p2)
+
+DimHeatmap(object = comb, reduction.type = "cca", cells.use = 500, dim.use = 1:9, 
+    do.balanced = TRUE)
+DimHeatmap(object = comb, reduction.type = "cca", cells.use = 500, dim.use = 10:18, 
+    do.balanced = TRUE)
+DimHeatmap(object = comb, reduction.type = "cca", cells.use = 500, dim.use = 19:20, 
+    do.balanced = TRUE)
+```
+
+```{r}
+comb <- CalcVarExpRatio(object = comb, reduction.type = "pca", grouping.var = "protocol", 
+    dims.use = 1:20)
+comb.all.save <- comb
+comb <- SubsetData(object = comb, subset.name = "var.ratio.pca", accept.low = 0.5)
+```
+
+```{r}
+comb.discard <- SubsetData(object = comb.all.save, subset.name = "var.ratio.pca", 
+    accept.high = 0.5)
+median(x = comb@meta.data[, "nGene"])
+median(x = comb.discard@meta.data[, "nGene"])
+```
+
+```{r}
+comb <- AlignSubspace(object = comb, reduction.type = "cca", grouping.var = "protocol", 
+    dims.align = 1:20)
+```
+
+```{r}
+p1 <- VlnPlot(object = comb, features.plot = "ACC1", group.by = "protocol", 
+    do.return = TRUE)
+p2 <- VlnPlot(object = comb, features.plot = "ACC2", group.by = "protocol", 
+    do.return = TRUE)
+plot_grid(p1, p2)
+```
+
+# Clustering
+```{r}
+comb <- RunTSNE(object = comb, reduction.use = "cca.aligned", dims.use = 1:20, 
+    do.fast = TRUE)
+comb <- FindClusters(object = comb, reduction.type = "cca.aligned", dims.use = 1:20, 
+    save.SNN = TRUE)
+```
+
+#Plots
+```{r}
+p1 <- TSNEPlot(object = comb, group.by = "protocol", do.return = TRUE, pt.size = 0.5)
+p2 <- TSNEPlot(object = comb, do.return = TRUE, pt.size = 0.5,do.label=TRUE)
+plot_grid(p1, p2)
+
+samid <- substr(rownames(comb@meta.data),18,18)
+samid[samid==""]<-4
+comb@meta.data$organoid <- samid
+
+p3 <- TSNEPlot(object = comb, group.by = "organoid", do.return = TRUE, pt.size = 0.5)
+plot_grid(p3,p2)
+```
+
+# Make super annotation
+
+```{r}
+newann <- merge(y.b1$genes,y.b2$genes,all.x=TRUE,all.y=TRUE)
+rownames(newann) <- newann$OriginalEns
+```
+
+
+# Check expression of some kidney genes
+
+Here I check the expression of known kidney genes on a tSNE plot to help with cluster identification.
+
+```{r}
+#podocyte (WT1, MAFB, NPHS1)
+nphs1 <- rownames(newann)[match("NPHS1",newann$Symbol)]
+FeaturePlot(comb, nphs1,cols.use = c("grey","blue"),no.legend = FALSE)
+nphs2 <- rownames(newann)[match("NPHS2",newann$Symbol)]
+synpo <- rownames(newann)[match("SYNPO",newann$Symbol)]
+mafb<-rownames(newann)[match("MAFB",newann$Symbol)]
+wt1 <- rownames(newann)[match("WT1",newann$Symbol)]
+ptpro <- rownames(newann)[match("PTPRO",newann$Symbol)]
+
+pax8 <- rownames(newann)[match("PAX8",newann$Symbol)]
+
+#Cap mesenchyme
+eya1 <- rownames(newann)[match("EYA1",newann$Symbol)]
+six1 <- rownames(newann)[match("SIX1",newann$Symbol)]
+cited1<-rownames(newann)[match("CITED1",newann$Symbol)]
+FeaturePlot(comb, rownames(newann)[match("MEOX1",newann$Symbol)],cols.use = c("grey","blue"),no.legend = FALSE)
+
+cdh1 <- rownames(newann)[match("CDH1",newann$Symbol)]
+
+jag1<-rownames(newann)[match("JAG1",newann$Symbol)]
+
+# gata3 UE/proximal tubule?
+gata3<-rownames(newann)[match("GATA3",newann$Symbol)]
+
+#RET - UE
+ret<-rownames(newann)[match("RET",newann$Symbol)]
+FeaturePlot(comb, ret,cols.use = c("grey","blue"),no.legend = FALSE)
+
+#Epithelial
+cubn <-rownames(newann)[match("CUBN",newann$Symbol)]
+  
+epcam<-rownames(newann)[match("EPCAM",newann$Symbol)]
+
+#Endothelial
+pecam1<-rownames(newann)[match("PECAM1",newann$Symbol)]
+FeaturePlot(comb, pecam1,cols.use = c("grey","blue"),no.legend = FALSE)
+
+mmp1 <- rownames(newann)[match("MMP1",newann$Symbol)]
+
+#stroma (Col3a1, Pdgfra)
+col3a1<-rownames(newann)[match("COL3A1",newann$Symbol)]
+FeaturePlot(comb, col3a1,cols.use = c("grey","blue"),no.legend = FALSE)
+pdgfra<-rownames(newann)[match("PDGFRA",newann$Symbol)]
+FeaturePlot(comb, pdgfra,cols.use = c("grey","blue"),no.legend = FALSE)
+
+#early nephron (CDH16, HNF4A, PAX2).
+cdh16<-rownames(newann)[match("CDH16",newann$Symbol)]
+FeaturePlot(comb, cdh16,cols.use = c("grey","blue"),no.legend = FALSE)
+hnf4a<-rownames(newann)[match("HNF4A",newann$Symbol)]
+FeaturePlot(comb, hnf4a,cols.use = c("grey","blue"),no.legend = FALSE)
+pax2<-rownames(newann)[match("PAX2",newann$Symbol)]
+FeaturePlot(comb, pax2,cols.use = c("grey","blue"),no.legend = FALSE)
+
+```
+
+```{r}
+# Supplementary Figure 3
+col3a1<-rownames(newann)[match("COL3A1",newann$Symbol)]
+fp1 <- FeaturePlot(comb, col3a1,cols.use = c("grey","blue"),no.legend = FALSE)
+pdgfra<-rownames(newann)[match("PDGFRA",newann$Symbol)]
+fp2 <- FeaturePlot(comb, pdgfra,cols.use = c("grey","blue"),no.legend = FALSE)
+pecam1<-rownames(newann)[match("PECAM1",newann$Symbol)]
+fp3 <- FeaturePlot(comb, pecam1,cols.use = c("grey","blue"),no.legend = FALSE)
+wt1 <- rownames(newann)[match("WT1",newann$Symbol)]
+fp4 <- FeaturePlot(comb, wt1,cols.use = c("grey","blue"),no.legend = FALSE)
+mafb<-rownames(newann)[match("MAFB",newann$Symbol)]
+fp5 <- FeaturePlot(comb, mafb,cols.use = c("grey","blue"),no.legend = FALSE)
+nphs1 <- rownames(newann)[match("NPHS1",newann$Symbol)]
+fp6<-FeaturePlot(comb, nphs1,cols.use = c("grey","blue"),no.legend = FALSE)
+cdh16<-rownames(newann)[match("CDH16",newann$Symbol)]
+fp7<-FeaturePlot(comb, cdh16,cols.use = c("grey","blue"),no.legend = FALSE)
+hnf4a<-rownames(newann)[match("HNF4A",newann$Symbol)]
+fp8<-FeaturePlot(comb, hnf4a,cols.use = c("grey","blue"),no.legend = FALSE)
+pax2<-rownames(newann)[match("PAX2",newann$Symbol)]
+fp9<-FeaturePlot(comb, pax2,cols.use = c("grey","blue"),no.legend = FALSE)
+
+pdf("FeaturePlots-celltypemarkers.pdf",width=10,height=10)
+FeaturePlot(comb, features.plot=c(col3a1,pdgfra,pecam1,wt1,mafb,nphs1,cdh16,hnf4a,pax2),cols.use = c("grey","blue"),no.legend = TRUE)
+dev.off()
+
+png("FeaturePlots-celltypemarkers.png",width=600,height=600)
+FeaturePlot(comb, features.plot=c(col3a1,pdgfra,pecam1,wt1,mafb,nphs1,cdh16,hnf4a,pax2),cols.use = c("grey","blue"),no.legend = TRUE)
+dev.off()
+```
+
+
+```{r}
+# Cell type markers
+ct <- c("SIX1","SIX2","EYA1","CITED1","PAX8","CDH16","LHX1","SPINT1","FXYD2","ASS1","ATP1B1","MAFB","PODXL",
+        "PTPRO","WT1","DLK1","DCN","COL1A1","COL3A1","PDGFRA","PDGFRB","PECAM1","CDH5","KDR","SOX17")
+m <- match(ct,newann$Symbol)
+ens.ct <- rownames(newann)[m]
+pdf("Heatmap-25celltypemarkers.pdf",width=10,height=6)
+DoHeatmap(object = comb, genes.use = ens.ct, slim.col.label = TRUE, remove.key = TRUE)
+dev.off()
+```
+
+
+# Find markers for each cluster
+```{r}
+markers <- FindAllMarkers(comb, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25, test.use="roc")
+```
+
+```{r}
+m <- match(markers$gene,rownames(newann))
+
+results <- data.frame(markers,newann[m,3:6])
+
+write.csv(results,file="seurat-organoid-markers.csv")
+```
+
+#Rename cluster IDs
+
+Based on the Seurat marker analysis and prior knowledge of the developing mouse kidney, we were able to assign cell types to each of the clusters.
+
+```{r}
+current.cluster.ids <- c(0, 1, 2, 3, 4, 5, 6, 7,8,9,10,11,12)
+new.cluster.ids <- c("interstitialA","interstitialB","MEIS1 stroma","cell cycle related",
+                     "podocyte","endothelium","mitosis","stroma/bone/skeleton?",
+                     "neurogenesis","metanephric mesenchyme",
+                     "collecting duct/ureteric stalk","mesangial/neural?",
+                     "myeloid/immune")
+comb.id <- comb
+comb.id@ident <- plyr::mapvalues(x = comb@ident, from = current.cluster.ids, to = new.cluster.ids)
+TSNEPlot(object = comb.id, do.label = TRUE,pt.size = 0.5,label.size=5,no.legend=TRUE)
+
+```
+
+# Investigate variability genes and proportions of cells
+
+```{r}
+# Number of cells from each organoid
+barplot(table(comb@meta.data$organoid))
+ 
+# Number of cells per cluster
+barplot(table(comb@ident))
+
+# Proportions
+tab <- table(comb@meta.data$organoid,comb@ident)
+rowSums(tab)
+prop<-tab/rowSums(tab)
+
+par(mfrow=c(1,1))
+par(mar=c(4.5,5,2,2))
+barplot(prop,beside=TRUE,col=ggplotColors(4),xlab="Cluster",ylab="Proportion of cells contributing to cell type",cex.lab=1.5,cex.axis=1.5,cex.names=1.5)
+legend("topright",legend=paste("Organoid",1:4),fill=ggplotColors(4),cex=1.5)
+```
+
+```{r}
+#Load most variable genes list
+vargenes <- read.csv("./tables/VarCompResults.csv",stringsAsFactors=FALSE)
+vargenes$VarRank <- c(1:nrow(vargenes))
+```
+
+
+```{r}
+# Look at most variable genes split across the organoids
+topvar <- vargenes$symbol[1:10]
+m <- match(topvar,newann$Symbol)
+ens.var <- rownames(newann)[m]
+pdf("tSNE-topvar1to5-byorganoid.pdf",height=8,width=8)
+FeatureHeatmap(comb, features.plot = c(ens.var[c(1,2,3,4,5)]), group.by = "organoid", pt.size = 0.25, key.position = "top", 
+    max.exp = 3)
+dev.off()
+pdf("tSNE-topvar6to10-byorganoid.pdf",height=8,width=8)
+FeatureHeatmap(comb, features.plot = c(ens.var[c(6,7,8,9,10)]), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+png("tSNE-topvar1to10-byorganoid.png",height=1200,width=700)
+FeatureHeatmap(comb, features.plot = c(ens.var[1:10]), group.by = "organoid", pt.size = 0.25, key.position = "top", 
+    max.exp = 3)
+dev.off()
+
+
+png("tSNE-topvar1345-byorganoid.png",height=600,width=600)
+FeatureHeatmap(comb, features.plot = c(ens.var[c(1,3,4,5)]), group.by = "organoid", pt.size = 0.25, key.position = "top", 
+    max.exp = 3)
+dev.off()
+png("tSNE-topvar6789-byorganoid.png",height=600,width=600)
+FeatureHeatmap(comb, features.plot = c(ens.var[c(6,7,8,9)]), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+```
+
+```{r}
+# Feature heatmaps for marker genes jag1, pax2, mafb
+pdf("tSNE-markergenes-byorganoid.pdf",height=6,width=8)
+FeatureHeatmap(comb, features.plot = c(jag1,pax2,mafb), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+png("tSNE-markergenes-byorganoid.png",height=450,width=700)
+FeatureHeatmap(comb, features.plot = c(jag1,pax2,mafb), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+# feature heatmaps for var genes nphs2, ptpro, mmp1
+pdf("tSNE-vargenes-byorganoid.pdf",height=6,width=8)
+FeatureHeatmap(comb, features.plot = c(nphs2,ptpro,mmp1), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+png("tSNE-vargenes-byorganoid.png",height=450,width=700)
+FeatureHeatmap(comb, features.plot = c(nphs2,ptpro,mmp1), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+# Figure 4D/E
+png("featureplot-5genes-byorganoid.png",height=800,width=800)
+FeatureHeatmap(comb, features.plot = c(nphs2,ptpro,mmp1,pax2,mafb), group.by = "organoid", pt.size = 0.25, key.position = "top",max.exp = 3)
+dev.off()
+
+```
+
+
+```{r}
+# %expressed
+mean(comb@raw.data[nphs2,comb@meta.data$organoid==1]>0)
+mean(comb@raw.data[nphs2,comb@meta.data$organoid==2]>0)
+mean(comb@raw.data[nphs2,comb@meta.data$organoid==3]>0)
+mean(comb@raw.data[nphs2,comb@meta.data$organoid==4]>0)
+
+mean(comb@raw.data[ptpro,comb@meta.data$organoid==1]>0)
+mean(comb@raw.data[ptpro,comb@meta.data$organoid==2]>0)
+mean(comb@raw.data[ptpro,comb@meta.data$organoid==3]>0)
+mean(comb@raw.data[ptpro,comb@meta.data$organoid==4]>0)
+
+mean(comb@raw.data[mmp1,comb@meta.data$organoid==1]>0)
+mean(comb@raw.data[mmp1,comb@meta.data$organoid==2]>0)
+mean(comb@raw.data[mmp1,comb@meta.data$organoid==3]>0)
+mean(comb@raw.data[mmp1,comb@meta.data$organoid==4]>0)
+
+mean(comb@raw.data[pax2,comb@meta.data$organoid==1]>0)
+mean(comb@raw.data[pax2,comb@meta.data$organoid==2]>0)
+mean(comb@raw.data[pax2,comb@meta.data$organoid==3]>0)
+mean(comb@raw.data[pax2,comb@meta.data$organoid==4]>0)
+
+mean(comb@raw.data[mafb,comb@meta.data$organoid==1]>0)
+mean(comb@raw.data[mafb,comb@meta.data$organoid==2]>0)
+mean(comb@raw.data[mafb,comb@meta.data$organoid==3]>0)
+mean(comb@raw.data[mafb,comb@meta.data$organoid==4]>0)
+```
+
+
+# Calculate average expression by cluster
+```{r}
+clust <- factor(comb@ident)
+#comb@data is already logged
+# This is very slow, just read in data
+#avg.cl.exp <- matrix(0,nrow=nrow(comb@data),ncol=13)
+#for(i in 1:nrow(avg.cl.exp)){
+#  avg.cl.exp[i,] <- tapply(comb@data[i,],clust,mean)
+#}
+
+```
+```{r}
+#rownames(avg.cl.exp)[1:5]
+#rownames(avg.cl.exp)<- rownames(comb@data)
+#colnames(avg.cl.exp)<-paste("Clust",0:12,sep="")
+```
+
+```{r}
+#saveRDS(avg.cl.exp,file="AvgExpByClust.rds")
+readRDS("AvgExpByClust.rds")
+```
+
+
+
+
+```{r}
+par(mfrow=c(1,1))
+aheatmap(avg.cl.exp[ens.ct,],labRow = ct,Colv = NA,Rowv = NA)
+```
+
+```{r}
+topvar <- vargenes$symbol[1:50]
+m <- match(topvar,newann$Symbol)
+ens.var <- rownames(newann)[m[!is.na(m)]]
+m2 <- match(ens.var,rownames(avg.cl.exp))
+ens.var <- ens.var[!is.na(m2)]
+m3 <- match(ens.var,rownames(newann))
+symb.var <- newann$Symbol[m3]
+aheatmap(avg.cl.exp[m2[!is.na(m2)],],labRow=symb.var,Colv = NA,Rowv = NA)
+```
+
+```{r}
+par(mfrow=c(1,1))
+par(mar=c(6.5,4,2,2))
+newgroup <- paste("Clust",comb@ident,"Org",comb@meta.data$organoid,sep="")
+newgroup <- factor(newgroup,levels=c("Clust0Org1","Clust0Org2","Clust0Org3","Clust0Org4",
+                                     "Clust1Org1","Clust1Org2","Clust1Org3","Clust1Org4",
+                                     "Clust2Org1","Clust2Org2","Clust2Org3","Clust2Org4",
+                                     "Clust3Org1","Clust3Org2","Clust3Org3","Clust3Org4",
+                                     "Clust4Org1","Clust4Org2","Clust4Org3","Clust4Org4",
+                                     "Clust5Org1","Clust5Org2","Clust5Org3","Clust5Org4",
+                                     "Clust6Org1","Clust6Org2","Clust6Org3","Clust6Org4",
+                                     "Clust7Org1","Clust7Org2","Clust7Org3","Clust7Org4",
+                                     "Clust8Org1","Clust8Org2","Clust8Org3","Clust8Org4",
+                                     "Clust9Org1","Clust9Org2","Clust9Org3","Clust9Org4",
+                                     "Clust10Org1","Clust10Org2","Clust10Org3","Clust10Org4",
+                                     "Clust11Org1","Clust11Org2","Clust11Org3","Clust11Org4",
+                                     "Clust12Org1","Clust12Org2","Clust12Org3"))
+boxplot(comb@data[jag1,]~newgroup,las=2,col=ggplotColors(4))
+boxplot(comb@data[nphs2,]~newgroup,las=2,col=ggplotColors(4))
+boxplot(comb@data[ptpro,]~newgroup,las=2,col=ggplotColors(4))
+boxplot(comb@data[mmp1,]~newgroup,las=2,col=ggplotColors(4))
+```
+
+
+```{r}
+# Marker genes
+data.ct <- as.matrix(comb@data[ens.ct,])
+avg.cl.org.exp <- matrix(0,nrow=nrow(data.ct),ncol=length(levels(newgroup)))
+for(i in 1:nrow(avg.cl.org.exp)){
+  avg.cl.org.exp[i,] <- tapply(data.ct[i,],newgroup,mean)
+}
+colnames(avg.cl.org.exp)<-levels(newgroup)
+
+cl <- gsub("O.*","",levels(newgroup))
+cl <- gsub("Clust","",cl)
+cl <- factor(cl,levels=c(0,1,2,3,4,5,6,7,8,9,10,11,12))
+
+par(mfrow=c(1,1))
+aheatmap(avg.cl.org.exp,labRow = ct,annCol=list(Cluster=cl),Colv = NA,Rowv = NA)
+
+```
+
+```{r}
+# Variable genes
+data.var <- as.matrix(comb@data[ens.var,])
+avg.cl.org.var <- matrix(0,nrow=nrow(data.var),ncol=length(levels(newgroup)))
+for(i in 1:nrow(avg.cl.org.var)){
+  avg.cl.org.var[i,] <- tapply(data.var[i,],newgroup,mean)
+}
+colnames(avg.cl.org.var)<-levels(newgroup)
+
+cl <- gsub("O.*","",levels(newgroup))
+cl <- gsub("Clust","",cl)
+cl <- factor(cl,levels=c(0,1,2,3,4,5,6,7,8,9,10,11,12))
+
+par(mfrow=c(1,1))
+aheatmap(avg.cl.org.var,labRow = symb.var,annCol=list(Cluster=cl),Colv = NA,Rowv = NA)
+```
+
+
+----------------------------------------------------------------------
+
+
+# Use edgeR and TREAT to find significantly DE genes between clusters
+
+I performed additional differential expression analysis to complement the Seurat marker analysis. I prefer to use edgeR glms and then impose a log-fold-change cut-off using TREAT. We chose a logFC cut-off of 1 (i.e. 2-fold). We focussed our interpretation on the genes up-regulated in each cluster (logFC > 1 and FDR<0.05).
+
+```{r}
+myclust <- paste("c",targets$clust,sep="")
+des.batch <- model.matrix(~0+myclust)
+colnames(des.batch) <-levels(factor(myclust))
+```
+
+```{r}
+y.keep <- DGEList(comb.counts)
+```
+
+```{r}
+y.batch <- estimateDisp(y.keep,design=des.batch)
+
+plotBCV(y.batch)
+
+fit.batch <- glmFit(y.batch,des.batch)
+my.contrasts <- makeContrasts(c0=c0-(c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c1=c1-(c0+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c2=c2-(c1+c0+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c3=c3-(c1+c2+c0+c4+c5+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c4=c4-(c1+c2+c3+c0+c5+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c5=c5-(c1+c2+c3+c4+c0+c6+c7+c8+c9+c10+c11+c12)/12,
+                              c6=c6-(c1+c2+c3+c4+c5+c0+c7+c8+c9+c10+c11+c12)/12,
+                              c7=c7-(c1+c2+c3+c4+c5+c6+c0+c8+c9+c10+c11+c12)/12,
+                              c8=c8-(c1+c2+c3+c4+c5+c6+c7+c0+c9+c10+c11+c12)/12,
+                              c9=c9-(c1+c2+c3+c4+c5+c6+c7+c8+c0+c10+c11+c12)/12,
+                              c10=c10-(c1+c2+c3+c4+c5+c6+c7+c8+c9+c0+c11+c12)/12,
+                              c11=c11-(c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c0+c12)/12,
+                              c12=c12-(c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c0)/12,
+                              levels=des.batch)
+
+lrt.c0 <- glmTreat(fit.batch, contrast=my.contrasts[,"c0"],lfc=1)  
+lrt.c1 <- glmTreat(fit.batch, contrast=my.contrasts[,"c1"],lfc=1)
+lrt.c2 <- glmTreat(fit.batch, contrast=my.contrasts[,"c2"],lfc=1)
+lrt.c3 <- glmTreat(fit.batch, contrast=my.contrasts[,"c3"],lfc=1)
+lrt.c4 <- glmTreat(fit.batch, contrast=my.contrasts[,"c4"],lfc=1)
+lrt.c5 <- glmTreat(fit.batch, contrast=my.contrasts[,"c5"],lfc=1)
+lrt.c6 <- glmTreat(fit.batch, contrast=my.contrasts[,"c6"],lfc=1)
+lrt.c7 <- glmTreat(fit.batch, contrast=my.contrasts[,"c7"],lfc=1)
+lrt.c8 <- glmTreat(fit.batch, contrast=my.contrasts[,"c8"],lfc=1)
+lrt.c9 <- glmTreat(fit.batch, contrast=my.contrasts[,"c9"],lfc=1)
+lrt.c10 <- glmTreat(fit.batch, contrast=my.contrasts[,"c10"],lfc=1)
+lrt.c11 <- glmTreat(fit.batch, contrast=my.contrasts[,"c11"],lfc=1)
+lrt.c12 <- glmTreat(fit.batch, contrast=my.contrasts[,"c12"],lfc=1)
+```
+
+```{r}
+top.c0 <- topTags(lrt.c0,n="Inf")$table
+top.c1 <- topTags(lrt.c1,n="Inf")$table
+top.c2 <- topTags(lrt.c2,n="Inf")$table
+top.c3 <- topTags(lrt.c3,n="Inf")$table
+top.c4 <- topTags(lrt.c4,n="Inf")$table
+top.c5 <- topTags(lrt.c5,n="Inf")$table
+top.c6 <- topTags(lrt.c6,n="Inf")$table
+top.c7 <- topTags(lrt.c7,n="Inf")$table
+top.c8 <- topTags(lrt.c8,n="Inf")$table
+top.c9 <- topTags(lrt.c9,n="Inf")$table
+top.c10 <- topTags(lrt.c10,n="Inf")$table
+top.c11 <- topTags(lrt.c11,n="Inf")$table
+top.c12 <- topTags(lrt.c12,n="Inf")$table
+```
+
+```{r}
+a0 <- newann[match(rownames(top.c0),rownames(newann)),]
+top.c0 <- data.frame(a0,top.c0)
+
+a1 <- newann[match(rownames(top.c1),rownames(newann)),]
+top.c1 <- data.frame(a1,top.c1)
+
+a2 <- newann[match(rownames(top.c2),rownames(newann)),]
+top.c2 <- data.frame(a2,top.c2)
+
+a3 <- newann[match(rownames(top.c3),rownames(newann)),]
+top.c3 <- data.frame(a3,top.c3)
+
+a4 <- newann[match(rownames(top.c4),rownames(newann)),]
+top.c4 <- data.frame(a4,top.c4)
+
+a5 <- newann[match(rownames(top.c5),rownames(newann)),]
+top.c5 <- data.frame(a5,top.c5)
+
+a6 <- newann[match(rownames(top.c6),rownames(newann)),]
+top.c6 <- data.frame(a6,top.c6)
+
+a7 <- newann[match(rownames(top.c7),rownames(newann)),]
+top.c7 <- data.frame(a7,top.c7)
+
+a8 <- newann[match(rownames(top.c8),rownames(newann)),]
+top.c8 <- data.frame(a8,top.c8)
+
+a9 <- newann[match(rownames(top.c9),rownames(newann)),]
+top.c9 <- data.frame(a9,top.c9)
+
+a10 <- newann[match(rownames(top.c10),rownames(newann)),]
+top.c10 <- data.frame(a10,top.c10)
+
+a11 <- newann[match(rownames(top.c11),rownames(newann)),]
+top.c11 <- data.frame(a11,top.c11)
+
+a12 <- newann[match(rownames(top.c12),rownames(newann)),]
+top.c12 <- data.frame(a12,top.c12)
+
+```
+
+
+```{r}
+# Upregulated genes only
+write.csv(top.c0[top.c0$logFC>0,],file="./tables/DE-cluster0-upgenes.csv")
+write.csv(top.c1[top.c1$logFC>0,],file="./tables/DE-cluster1-upgenes.csv")
+write.csv(top.c2[top.c2$logFC>0,],file="./tables/DE-cluster2-upgenes.csv")
+write.csv(top.c3[top.c3$logFC>0,],file="./tables/DE-cluster3-upgenes.csv")
+write.csv(top.c4[top.c4$logFC>0,],file="./tables/DE-cluster4-upgenes.csv")
+write.csv(top.c5[top.c5$logFC>0,],file="./tables/DE-cluster5-upgenes.csv")
+write.csv(top.c6[top.c6$logFC>0,],file="./tables/DE-cluster6-upgenes.csv")
+write.csv(top.c7[top.c7$logFC>0,],file="./tables/DE-cluster7-upgenes.csv")
+write.csv(top.c8[top.c8$logFC>0,],file="./tables/DE-cluster8-upgenes.csv")
+write.csv(top.c9[top.c9$logFC>0,],file="./tables/DE-cluster9-upgenes.csv")
+write.csv(top.c10[top.c10$logFC>0,],file="./tables/DE-cluster10-upgenes.csv")
+write.csv(top.c11[top.c11$logFC>0,],file="./tables/DE-cluster11-upgenes.csv")
+write.csv(top.c12[top.c12$logFC>0,],file="./tables/DE-cluster12-upgenes.csv")
+```
+
+
+
+
